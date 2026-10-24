@@ -38,14 +38,17 @@ use crate::plan::Mode;
 #[command(
     name = "onemodel",
     version,
-    about = "Keep one copy of each AI model file on disk, using copy-on-write clones"
+    about = "Keep one copy of each AI model file on disk, using copy-on-write clones",
+    long_about = "Finds byte-identical model files across Ollama, Hugging Face, LM Studio, llama.cpp \
+and any directory you name, and replaces duplicates with copy-on-write clones of one copy. Every \
+change is journaled first, so an interrupted run can be resumed or undone."
 )]
 struct Cli {
-    /// Also treat DIR as a store. Repeatable. Every regular file >= --min-size inside is a candidate.
+    /// Also treat DIR as a store. Repeatable. Every regular file of at least --min-size inside is a candidate.
     #[arg(long = "path", value_name = "DIR", global = true)]
     paths: Vec<PathBuf>,
 
-    /// Ignore files smaller than this. Accepts K, M, G suffixes (powers of 1024).
+    /// Ignore files smaller than this. Accepts K, M and G suffixes (powers of 1024).
     #[arg(long, value_name = "SIZE", default_value = "32M", value_parser = parse_size, global = true)]
     min_size: u64,
 
@@ -63,19 +66,19 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Find stores and duplicate groups and report reclaimable space. Changes nothing.
+    /// Find stores and duplicate files and report reclaimable space. Changes nothing.
     Scan,
-    /// Replace duplicates with clones of one keeper per volume. Resumes an interrupted run first.
+    /// Replace duplicates with clones of one copy per volume. Finishes an interrupted run first.
     Dedupe {
-        /// Show exactly what would be replaced or refused, then stop. Writes no journal.
+        /// Show what would be replaced or refused, then stop. Writes nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Use hard links instead of clones. DANGEROUS: an app writing one path changes every path,
-        /// and per-path xattrs are lost. Prints a warning; works on filesystems without clone support.
+        /// Use hard links instead of clones. A write through any one path then changes every path,
+        /// and each path loses its own xattrs. Works on filesystems without clone support.
         #[arg(long)]
         hardlink: bool,
     },
-    /// Turn every file onemodel replaced back into an independent copy (needs the space back).
+    /// Turn every file onemodel replaced back into an independent copy. Needs the space back.
     Undo {
         /// Only undo this run (ids are listed by `scan`). Default: every run, newest first.
         #[arg(long, value_name = "RUN_ID")]
@@ -84,9 +87,10 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         only: Vec<PathBuf>,
     },
-    /// Check every managed file is still byte-identical to its planned content and every store is intact.
+    /// Check that every managed file still has its planned bytes and every store is intact.
+    /// Exits with status 2 if anything is wrong.
     Verify {
-        /// Also re-hash every Ollama and HF blob against the sha256 in its name.
+        /// Also check every Ollama blob against the sha256 in its manifest.
         #[arg(long)]
         deep: bool,
     },
@@ -94,7 +98,7 @@ enum Cmd {
 
 /// Everything onemodel reads from the process environment, captured once in `main`.
 /// Stores locate themselves only through this, so tests isolate the binary from the real machine by
-/// setting `HOME` (and clearing `OLLAMA_MODELS` etc.), which is exactly what a user's shell does.
+/// setting `HOME` and the store variables, which is exactly what a user's shell does.
 #[derive(Debug, Clone)]
 pub struct Env {
     pub home: PathBuf,
@@ -178,7 +182,7 @@ pub enum Exit {
     Ok = 0,
     /// Operational error: journal unwritable, another onemodel holds the lock, bad arguments.
     Error = 1,
-    /// `verify` found a problem, or `dedupe`/`undo` left an op it could not settle.
+    /// `verify` found a problem, or `undo` left an op it could not settle.
     Problems = 2,
 }
 
@@ -216,9 +220,9 @@ fn run(cli: Cli) -> anyhow::Result<Exit> {
     }
 }
 
-const HARDLINK_WARNING: &str = "warning: --hardlink makes every duplicate the SAME file. If any app \
-writes to one path, every other path changes too, and per-path xattrs are replaced by the keeper's. \
-Prefer clones (the default) on APFS, btrfs and XFS.";
+const HARDLINK_WARNING: &str = "warning: --hardlink makes every duplicate the same file. If any app \
+writes to one path, every other path changes too, and each path's own xattrs are replaced by the \
+keeper's. Clones (the default) do not have this problem on APFS, btrfs and XFS.";
 
 /// Every report knows its exit code and both of its renderings, so `run` stays a dispatcher.
 pub trait Report: serde::Serialize {
