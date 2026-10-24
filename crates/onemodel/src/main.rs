@@ -189,12 +189,33 @@ fn render<R: Report>(json: bool, report: &R) -> anyhow::Result<Exit> {
     Ok(report.exit())
 }
 
-/// "32M" -> 33554432. Plain digits are bytes.
+/// "32M" -> 33554432. Plain digits are bytes; K, M, G (optionally followed by "iB" or "B") are
+/// powers of 1024.
 fn parse_size(s: &str) -> Result<u64, String> {
-    todo!("{s}")
+    let t = s.trim();
+    let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(digits);
+    let n: u64 = num.parse().map_err(|_| format!("{s:?} is not a size like 500M or 2G"))?;
+    let shift = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        _ => return Err(format!("{s:?} is not a size like 500M or 2G")),
+    };
+    n.checked_mul(1 << shift).ok_or_else(|| format!("{s:?} is too large"))
 }
 
 /// Human byte count in decimal GB/MB (matches Finder and `df -H`, which is how users check savings).
 pub fn fmt_bytes(n: u64) -> String {
-    todo!("{n}")
+    let f = n as f64;
+    if n >= 1_000_000_000 {
+        format!("{:.2} GB", f / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1} MB", f / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1} kB", f / 1e3)
+    } else {
+        format!("{n} B")
+    }
 }
