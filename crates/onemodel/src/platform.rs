@@ -160,15 +160,60 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     }
 }
 
-/// Make `to` carry `from`'s metadata: remove every xattr on `to`, set every xattr of `from`
-/// (nofollow), then mode, then atime/mtime last (xattr writes do not touch mtime, but ordering it
-/// last makes that irrelevant). Ownership is not copied (plan refuses foreign-owned targets).
-/// Linux: an xattr outside the `user.` namespace that cannot be set is tolerated only if `to`
-/// already carries the same value (e.g. `security.selinux` inherited from the directory); otherwise
-/// the error propagates and the op is refused. Never silently drop metadata.
+/// xattrs the kernel owns. macOS attaches `com.apple.provenance` to every file a process creates;
+/// removing or setting it silently has no effect, so it is neither copied nor compared.
+pub const KERNEL_XATTRS: &[&str] = &["com.apple.provenance"];
+
+/// Make `to` carry `from`'s metadata: exactly `from`'s xattrs (nofollow), then mode, then
+/// atime/mtime last. `to` is made owner-writable first because xattr writes need write access and
+/// a clone starts with the keeper's mode (HF blobs are 0444). Ownership is not copied (plan refuses
+/// foreign-owned targets). An xattr that cannot be set is tolerated only if `to` already carries
+/// the same value (e.g. `security.selinux` inherited from the directory); otherwise the error
+/// propagates and the op is refused. Never silently drop metadata.
 pub fn copy_metadata(from: &Path, to: &Path) -> io::Result<()> {
-    let _ = (from, to);
-    todo!()
+    let meta = fs::symlink_metadata(from)?;
+    fs::set_permissions(to, fs::Permissions::from_mode(0o600))?;
+    let wanted = xattrs(from)?;
+    for (name, value) in xattrs(to)? {
+        if wanted.get(&name) != Some(&value) {
+            xattr::remove(to, &name)?;
+        }
+    }
+    for (name, value) in &wanted {
+        if let Err(e) = xattr::set(to, name, value)
+            && xattr::get(to, name)?.as_ref() != Some(value)
+        {
+            return Err(e);
+        }
+    }
+    fs::set_permissions(to, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    set_times(to, &meta)
+}
+
+/// Set `to`'s mode and mtime from a recorded fingerprint (hardlink-mode undo, where the target's
+/// own metadata was replaced by the keeper's).
+pub fn set_mode_and_mtime(to: &Path, mode: u32, mtime_ns: i64) -> io::Result<()> {
+    fs::set_permissions(to, fs::Permissions::from_mode(mode & 0o7777))?;
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns.max(0) as u64);
+    File::open(to)?.set_times(FileTimes::new().set_modified(mtime))
+}
+
+fn set_times(to: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    File::open(to)?.set_times(FileTimes::new().set_accessed(meta.accessed()?).set_modified(meta.modified()?))
+}
+
+/// Every xattr on `path` (nofollow) except the kernel-owned ones.
+pub fn xattrs(path: &Path) -> io::Result<BTreeMap<std::ffi::OsString, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for name in xattr::list(path)? {
+        if KERNEL_XATTRS.iter().any(|k| name == *k) {
+            continue;
+        }
+        if let Some(value) = xattr::get(path, &name)? {
+            out.insert(name, value);
+        }
+    }
+    Ok(out)
 }
 
 /// A real, unshared byte copy: create `dst` O_EXCL, read/write loop with an 8 MiB buffer.
