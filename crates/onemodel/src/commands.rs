@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::journal::{self, CrashPoint, Journal, Record, RunId, RunLog, RunWriter, crash_point};
 use crate::matching::{self, Fingerprint, Unreadable};
-use crate::plan::{self, GroupPlan, Mode, Plan, Refusal, Volume};
+use crate::plan::{self, GroupPlan, Mode, Plan, Volume};
 use crate::platform;
 use crate::replace::{self, Ctx, Outcome};
 use crate::stores::{self, Claim, Store};
@@ -187,21 +187,78 @@ fn measure(volumes: &[Volume]) -> anyhow::Result<Vec<(u64, u64)>> {
 
 #[derive(Serialize)]
 pub struct UndoReport {
-    pub results: Vec<(RunId, OpResult)>,
+    pub results: Vec<UndoResult>,
     pub space: Vec<SpaceDelta>,
+}
+
+#[derive(Serialize)]
+pub struct UndoResult {
+    pub run: RunId,
+    #[serde(flatten)]
+    pub result: OpResult,
 }
 
 /// ```text
 /// journal = open; runs = journal.runs()
-/// for each un-ended run (interrupted dedupe): settle in-flight ops with replace::drive's recovery
-///     rows only (Staged -> Done or Refused; Pending left Pending), append End. No new replaces.
-/// for run in runs newest-first (or only --run), ops in reverse order:
-///     replace::drive_undo(op, state)    // includes free-space check -> UndoRefused(NotEnoughSpace)
+/// for each un-ended run (interrupted dedupe): settle in-flight ops with replace::settle
+///     (Staged -> Done or Refused; Pending left Pending, its temp removed), append End.
+/// for run in runs newest-first (or only --run), ops in reverse order, targets under --only:
+///     replace::drive_undo(op, state)    // lsof and free-space checks -> UndoRefused
 /// ```
 /// Idempotent: a second `undo` finds every op Undone and does nothing.
-pub fn undo(env: &Env, run: Option<RunId>) -> anyhow::Result<UndoReport> {
-    let _ = (env, run, Refusal::ChangedSinceScan);
-    todo!()
+pub fn undo(env: &Env, run: Option<RunId>, only: &[PathBuf]) -> anyhow::Result<UndoReport> {
+    let journal = Journal::open(&env.state_dir())?;
+    let runs = journal.runs()?;
+    if let Some(id) = &run
+        && !runs.iter().any(|r| &r.id == id)
+    {
+        bail!("no run {id} in the journal");
+    }
+    let lsof = env.lsof();
+    for interrupted in runs.iter().filter(|r| !r.ended) {
+        let mut writer = journal.reopen(interrupted)?;
+        let mut cx = Ctx {
+            run: &interrupted.id,
+            plan: &interrupted.plan,
+            mode: interrupted.plan.mode,
+            lsof: &lsof,
+            writer: &mut writer,
+        };
+        for op in interrupted.plan.ops() {
+            replace::settle(&mut cx, op, &interrupted.ops[op.ix as usize])?;
+        }
+        writer.append(&Record::End { free_after: measure(&interrupted.plan.volumes)? })?;
+    }
+    let runs = journal.runs()?;
+    let selected: Vec<&RunLog> = runs.iter().rev().filter(|r| run.as_ref().is_none_or(|id| &r.id == id)).collect();
+    let mut volumes: Vec<Volume> = Vec::new();
+    for v in selected.iter().flat_map(|r| &r.plan.volumes) {
+        if !volumes.iter().any(|seen| seen.dev == v.dev) {
+            volumes.push(Volume { free_before: platform::free_bytes(&v.mount)?, ..v.clone() });
+        }
+    }
+    let mut results = Vec::new();
+    for log in selected {
+        let mut writer = journal.reopen(log)?;
+        let mut cx = Ctx { run: &log.id, plan: &log.plan, mode: log.plan.mode, lsof: &lsof, writer: &mut writer };
+        let ops: Vec<_> = log.plan.ops().collect();
+        for op in ops.into_iter().rev() {
+            if !only.is_empty() && !only.iter().any(|p| op.target.path.starts_with(p)) {
+                continue;
+            }
+            if let Some(outcome) = replace::drive_undo(&mut cx, op, &log.ops[op.ix as usize])? {
+                let result =
+                    OpResult { op: op.ix, target: op.target.path.clone(), keeper: op.keeper.path.clone(), outcome };
+                results.push(UndoResult { run: log.id.clone(), result });
+            }
+        }
+    }
+    let space = measure(&volumes)?
+        .into_iter()
+        .zip(&volumes)
+        .map(|((_, after), v)| SpaceDelta { mount: v.mount.clone(), free_before: v.free_before, free_after: after })
+        .collect();
+    Ok(UndoReport { results, space })
 }
 
 #[derive(Serialize)]
@@ -386,7 +443,7 @@ impl Report for UndoReport {
         format!("{} ops\n", self.results.len())
     }
     fn exit(&self) -> Exit {
-        let unsettled = self.results.iter().any(|(_, r)| matches!(r.outcome, Outcome::Refused { .. }));
+        let unsettled = self.results.iter().any(|r| matches!(r.result.outcome, Outcome::Refused { .. }));
         if unsettled { Exit::Problems } else { Exit::Ok }
     }
 }

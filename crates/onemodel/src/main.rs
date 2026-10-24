@@ -80,6 +80,9 @@ enum Cmd {
         /// Only undo this run (ids are listed by `scan`). Default: every run, newest first.
         #[arg(long, value_name = "RUN_ID")]
         run: Option<RunId>,
+        /// Only undo files under PATH. Repeatable.
+        #[arg(long, value_name = "PATH")]
+        only: Vec<PathBuf>,
     },
     /// Check every managed file is still byte-identical to its planned content and every store is intact.
     Verify {
@@ -181,8 +184,7 @@ pub enum Exit {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = run(cli);
-    match result {
+    match run(cli) {
         Ok(exit) => ExitCode::from(exit as u8),
         Err(err) => {
             eprintln!("onemodel: {err:#}");
@@ -195,26 +197,22 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> anyhow::Result<Exit> {
     let env = Env::from_process(cli.paths, cli.min_size, cli.state)?;
     match cli.cmd {
-        Cmd::Scan => {
-            let report = commands::scan(&env)?;
-            render(&env, cli.json, &report)
-        }
+        Cmd::Scan => render(&env, cli.json, &commands::scan(&env)?),
         Cmd::Dedupe { dry_run, hardlink } => {
-            let mode = if hardlink { Mode::Hardlink } else { Mode::Clone };
             if hardlink {
-                eprintln!("{}", HARDLINK_WARNING);
+                eprintln!("{HARDLINK_WARNING}");
             }
-            let report = commands::dedupe(&env, mode, dry_run)?;
-            render(&env, cli.json, &report)
+            let mode = if hardlink { Mode::Hardlink } else { Mode::Clone };
+            render(&env, cli.json, &commands::dedupe(&env, mode, dry_run)?)
         }
-        Cmd::Undo { run } => {
-            let report = commands::undo(&env, run)?;
-            render(&env, cli.json, &report)
+        Cmd::Undo { run, only } => {
+            let only = only
+                .iter()
+                .map(|p| std::fs::canonicalize(p).with_context(|| format!("--only {}", p.display())))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            render(&env, cli.json, &commands::undo(&env, run, &only)?)
         }
-        Cmd::Verify { deep } => {
-            let report = commands::verify(&env, deep)?;
-            render(&env, cli.json, &report)
-        }
+        Cmd::Verify { deep } => render(&env, cli.json, &commands::verify(&env, deep)?),
     }
 }
 
