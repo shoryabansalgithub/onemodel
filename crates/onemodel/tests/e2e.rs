@@ -296,40 +296,35 @@ struct Disk(Vec<String>);
 fn disk(fx: &Fixture) -> Disk {
     let mut lines = Vec::new();
     let mut inodes: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
-    let mut stack = vec![fx.home.clone()];
-    while let Some(dir) = stack.pop() {
-        let mut entries: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
-        entries.sort();
-        for path in entries {
-            let rel = fx.name(&path.to_string_lossy());
-            let meta = fs::symlink_metadata(&path).unwrap();
-            if meta.file_type().is_symlink() {
-                let target = fs::read_link(&path).unwrap();
-                let resolves = fs::metadata(&path).is_ok_and(|m| m.is_file());
-                lines.push(format!("link {rel} -> {} resolves={resolves}", fx.name(&target.to_string_lossy())));
-            } else if meta.is_dir() {
-                lines.push(format!("dir  {rel}"));
-                stack.push(path);
-            } else {
-                let mut xattrs: Vec<String> = xattr::list(&path)
-                    .unwrap()
-                    .filter(|n| n != "com.apple.provenance")
-                    .map(|n| {
-                        let v = xattr::get(&path, &n).unwrap().unwrap_or_default();
-                        format!("{}={}", n.to_string_lossy(), String::from_utf8_lossy(&v))
-                    })
-                    .collect();
-                xattrs.sort();
-                let hash = blake3::hash(&fs::read(&path).unwrap()).to_hex();
-                lines.push(format!(
-                    "file {rel} {} mode={:o} mtime={}.{} xattrs={xattrs:?}",
-                    &hash[..16],
-                    meta.mode() & 0o7777,
-                    meta.mtime(),
-                    meta.mtime_nsec()
-                ));
-                inodes.entry((meta.dev(), meta.ino())).or_default().push(rel);
-            }
+    for entry in walkdir::WalkDir::new(&fx.home).min_depth(1).follow_links(false) {
+        let path = entry.unwrap().into_path();
+        let rel = fx.name(&path.to_string_lossy());
+        let meta = fs::symlink_metadata(&path).unwrap();
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&path).unwrap();
+            let resolves = fs::metadata(&path).is_ok_and(|m| m.is_file());
+            lines.push(format!("link {rel} -> {} resolves={resolves}", fx.name(&target.to_string_lossy())));
+        } else if meta.is_dir() {
+            lines.push(format!("dir  {rel}"));
+        } else {
+            let mut xattrs: Vec<String> = xattr::list(&path)
+                .unwrap()
+                .filter(|n| n != "com.apple.provenance")
+                .map(|n| {
+                    let v = xattr::get(&path, &n).unwrap().unwrap_or_default();
+                    format!("{}={}", n.to_string_lossy(), String::from_utf8_lossy(&v))
+                })
+                .collect();
+            xattrs.sort();
+            let hash = blake3::hash(&fs::read(&path).unwrap()).to_hex();
+            lines.push(format!(
+                "file {rel} {} mode={:o} mtime={}.{} xattrs={xattrs:?}",
+                &hash[..16],
+                meta.mode() & 0o7777,
+                meta.mtime(),
+                meta.mtime_nsec()
+            ));
+            inodes.entry((meta.dev(), meta.ino())).or_default().push(rel);
         }
     }
     lines.sort();
