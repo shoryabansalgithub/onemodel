@@ -206,8 +206,12 @@ pub fn undo(env: &Env, run: Option<RunId>) -> anyhow::Result<UndoReport> {
 
 #[derive(Serialize)]
 pub struct VerifyReport {
+    /// Managed files (and their keepers) whose full content was hashed.
     pub checked_files: u32,
     pub checked_bytes: u64,
+    /// Store roots whose claims were checked, and how many claims in total.
+    pub stores: u32,
+    pub claims: u32,
     pub problems: Vec<Problem>,
     /// Managed files an app has since replaced (new inode). Informational: no longer ours.
     pub released: Vec<PathBuf>,
@@ -223,21 +227,141 @@ pub enum Problem {
     Missing {
         path: PathBuf,
     },
+    Unreadable {
+        path: PathBuf,
+        error: String,
+    },
     /// A dedupe was interrupted; run `onemodel dedupe` to finish it or `onemodel undo`.
     Interrupted {
         run: RunId,
     },
+    /// A store's metadata names a file that is not there (or is not a regular file).
+    ClaimMissing {
+        store: String,
+        path: PathBuf,
+    },
+    ClaimSizeMismatch {
+        store: String,
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    ClaimDigestMismatch {
+        store: String,
+        path: PathBuf,
+    },
+    /// A snapshot symlink no longer leads to a regular file.
+    LinkBroken {
+        store: String,
+        link: PathBuf,
+    },
+    /// The store's own metadata could not be read or parsed.
+    ClaimsUnreadable {
+        store: String,
+        root: PathBuf,
+        error: String,
+    },
 }
 
-/// For every `journal::managed` entry whose target still has its post-rename inode: full BLAKE3 of
-/// target and (once per keeper) keeper equals the planned hash. Then every discovered store's
-/// `check_intact(deep)`. Exit 2 if `problems` is non-empty.
+/// Managed files: for every `journal::managed` entry whose target still has its post-rename inode,
+/// full BLAKE3 of target and (once per keeper) keeper equals the planned hash.
+/// Stores: every claim of every store root holds. A claimed sha256 is checked for files onemodel
+/// manages, and for every claimed file with `deep`. Exit 2 if `problems` is non-empty.
 pub fn verify(env: &Env, deep: bool) -> anyhow::Result<VerifyReport> {
-    let _ = (env, deep);
-    todo!()
+    let journal = Journal::open(&env.state_dir())?;
+    let runs = journal.runs()?;
+    let mut report = VerifyReport {
+        checked_files: 0,
+        checked_bytes: 0,
+        stores: 0,
+        claims: 0,
+        problems: Vec::new(),
+        released: Vec::new(),
+    };
+    for run in runs.iter().filter(|r| !r.ended) {
+        report.problems.push(Problem::Interrupted { run: run.id.clone() });
+    }
+    let mut keepers = BTreeSet::new();
+    let mut ours = BTreeSet::new();
+    for m in journal::managed(&runs) {
+        match Fingerprint::of(&m.target) {
+            Err(_) => report.problems.push(Problem::Missing { path: m.target.clone() }),
+            Ok(now) if now.id != m.ino => report.released.push(m.target.clone()),
+            Ok(_) => {
+                ours.insert(m.target.clone());
+                check_hash(&mut report, m.target.clone(), m.hash, m.size);
+            }
+        }
+        let keeper_is_ours = Fingerprint::of(&m.keeper).is_ok_and(|now| now.id == m.keeper_id);
+        if keeper_is_ours && keepers.insert(m.keeper.clone()) {
+            ours.insert(m.keeper.clone());
+            check_hash(&mut report, m.keeper.clone(), m.hash, m.size);
+        }
+    }
+    for (kind, root) in stores::locate(env) {
+        report.stores += 1;
+        let store = kind.name().to_string();
+        let claims = match kind.claims(&root) {
+            Ok(claims) => claims,
+            Err(e) => {
+                report.problems.push(Problem::ClaimsUnreadable { store, root, error: e.to_string() });
+                continue;
+            }
+        };
+        report.claims += claims.len() as u32;
+        for claim in claims {
+            if let Some(problem) = check_claim(&store, claim, |p| deep || ours.contains(p)) {
+                report.problems.push(problem);
+            }
+        }
+    }
+    Ok(report)
 }
 
-// ---------------------------------------------------------------------------------------------
+fn check_claim(store: &str, claim: Claim, hash_it: impl Fn(&Path) -> bool) -> Option<Problem> {
+    let store = store.to_string();
+    match claim {
+        Claim::LinkResolves { link } => {
+            let resolves = fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+                && fs::metadata(&link).is_ok_and(|m| m.is_file());
+            (!resolves).then_some(Problem::LinkBroken { store, link })
+        }
+        Claim::Regular { path, size, sha256 } => {
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                _ => return Some(Problem::ClaimMissing { store, path }),
+            };
+            if meta.len() != size {
+                return Some(Problem::ClaimSizeMismatch { store, path, expected: size, actual: meta.len() });
+            }
+            if !hash_it(&path) {
+                return None;
+            }
+            match sha256_file(&path) {
+                Ok(actual) if actual == sha256 => None,
+                Ok(_) => Some(Problem::ClaimDigestMismatch { store, path }),
+                Err(e) => Some(Problem::Unreadable { path, error: e.to_string() }),
+            }
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+fn check_hash(report: &mut VerifyReport, path: PathBuf, expected: matching::Hash, size: u64) {
+    report.checked_files += 1;
+    report.checked_bytes += size;
+    match matching::hash_file(&path) {
+        Ok(h) if h == expected => {}
+        Ok(_) => report.problems.push(Problem::ContentChanged { path }),
+        Err(e) => report.problems.push(Problem::Unreadable { path, error: e.to_string() }),
+    }
+}
 
 impl Report for ScanReport {
     fn human(&self) -> String {
