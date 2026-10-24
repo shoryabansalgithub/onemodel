@@ -11,11 +11,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Env;
 use crate::journal::Managed;
 use crate::matching::{Fingerprint, Hash, Matches, Unreadable};
 use crate::platform::Holder;
 use crate::stores::{Inventory, Store, StoreIx};
+use crate::{Env, fmt_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,12 +115,48 @@ pub enum Refusal {
     NotEnoughSpace { needed: u64, available: u64 },
     /// An unexpected I/O error at a named step; the temp file was removed.
     Io { step: String, error: String },
+    /// The file (keeper or target) carries a macOS extended ACL. clonefile would give the target the
+    /// keeper's ACL and onemodel does not copy ACLs.
+    HasAcl,
+    /// The run was interrupted and then undone before this file was replaced.
+    Interrupted,
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("one sentence per variant, e.g. \"open by ollama (pid 752)\"")
+        match self {
+            Refusal::DifferentVolume { keeper_mount } => write!(
+                f,
+                "no other copy on this volume, and clones cannot cross volumes (the keeper is on {})",
+                keeper_mount.display()
+            ),
+            Refusal::NoCloneSupport { fs_type } => write!(f, "the {fs_type} filesystem does not support clones"),
+            Refusal::OpenByProcess { holders } => {
+                let who: Vec<String> = holders.iter().map(|h| format!("{} (pid {})", h.command, h.pid)).collect();
+                write!(f, "open by {}", who.join(", "))
+            }
+            Refusal::OpenCheckFailed { detail } => write!(f, "could not check whether it is open: {detail}"),
+            Refusal::StoreDownloading { store, marker } => {
+                let name =
+                    marker.file_name().map_or_else(|| marker.display().to_string(), |n| n.to_string_lossy().into());
+                write!(f, "{store} is downloading ({name} exists)")
+            }
+            Refusal::MultiplyLinked { nlink } => {
+                write!(f, "it has {nlink} hard links, and replacing one name would split them")
+            }
+            Refusal::ForeignOwner { uid } => write!(f, "owned by another user (uid {uid})"),
+            Refusal::ChangedSinceScan => write!(f, "it changed after it was scanned"),
+            Refusal::ContentMismatch { offset } => write!(f, "its bytes differ from the keeper's at offset {offset}"),
+            Refusal::NotEnoughSpace { needed, available } => write!(
+                f,
+                "not enough free space to restore it ({} needed, {} free)",
+                fmt_bytes(*needed),
+                fmt_bytes(*available)
+            ),
+            Refusal::Io { step, error } => write!(f, "{step} failed: {error}"),
+            Refusal::HasAcl => write!(f, "it has an access control list, which onemodel does not copy"),
+            Refusal::Interrupted => write!(f, "the run was interrupted and undone before this file was replaced"),
+        }
     }
 }
 
