@@ -1,8 +1,3 @@
-//! Every OS call whose behaviour differs between macOS and Linux, and the crate's only `unsafe`.
-//!
-//! Each function has one signature and two `#[cfg]` bodies inside it; no other module mentions a
-//! target OS. The e2e suite exercises whichever body the host compiles.
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("onemodel supports macOS and Linux only");
 
@@ -18,7 +13,6 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 pub enum CloneError {
-    /// The filesystem cannot clone (ENOTSUP, EOPNOTSUPP, EXDEV, EINVAL from FICLONE on ext4/tmpfs).
     Unsupported,
     Io(io::Error),
 }
@@ -36,11 +30,8 @@ fn clone_error(e: io::Error) -> CloneError {
     }
 }
 
-/// Create `dst` (must not exist) as a copy-on-write clone of `src`.
 /// macOS: `clonefile(src, dst, CLONE_NOFOLLOW | CLONE_NOOWNERCOPY)`. Note it copies the SOURCE's
 /// mode, ACL and xattrs; `copy_metadata` must run after it.
-/// Linux: open src O_RDONLY, create dst O_WRONLY|O_CREAT|O_EXCL 0600, `ioctl(dst, FICLONE, src)`;
-/// on failure unlink dst.
 pub fn clone_file(src: &Path, dst: &Path) -> Result<(), CloneError> {
     #[cfg(target_os = "macos")]
     {
@@ -68,18 +59,12 @@ pub fn clone_file(src: &Path, dst: &Path) -> Result<(), CloneError> {
     }
 }
 
-/// Facts about the volume holding `path`. Persisted in the plan, so field names are journal format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Volume {
     pub dev: u64,
-    /// macOS: statfs `f_mntonname`. Linux: found by walking parents until `st_dev` changes.
     pub mount: PathBuf,
-    /// macOS: statfs `f_fstypename` ("apfs", "hfs"). Linux: name for the statfs `f_type` magic.
     pub fs_type: String,
-    /// apfs; btrfs; xfs. A statfs-level belief: the clone call itself is the final word
-    /// (ENOTSUP -> NoCloneSupport), and xfs reflink may still be off.
     pub clones: bool,
-    /// [`free_bytes`] when measured. In a plan that is plan time, hence the journal name.
     #[serde(rename = "free_before")]
     pub free: u64,
 }
@@ -135,7 +120,6 @@ fn statfs(path: &Path) -> io::Result<libc::statfs> {
     Ok(unsafe { st.assume_init() })
 }
 
-/// Free bytes for an unprivileged writer. The only source of the "freed" number onemodel reports.
 /// macOS: statfs `f_bavail * f_bsize` (statvfs counts are 32-bit there). Linux: statvfs
 /// `f_bavail * f_frsize`.
 pub fn free_bytes(path: &Path) -> io::Result<u64> {
@@ -163,14 +147,9 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
 /// removing or setting it silently has no effect, so it is neither copied nor compared.
 pub const KERNEL_XATTRS: &[&str] = &["com.apple.provenance"];
 
-/// Make `to` carry `from`'s metadata: exactly `from`'s xattrs (nofollow), then mode, then
-/// atime/mtime last. `to` is made owner-writable first because xattr writes need write access and
-/// a clone starts with the keeper's mode (HF blobs are 0444). Ownership is not copied (plan refuses
-/// foreign-owned targets). An xattr that cannot be set is tolerated only if `to` already carries
-/// the same value (e.g. `security.selinux` inherited from the directory); otherwise the error
-/// propagates and the op is refused. Never silently drop metadata.
 pub fn copy_metadata(from: &Path, to: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
+    // xattr writes need write access, and a clone starts with the keeper's mode (HF blobs are 0444).
     fs::set_permissions(to, fs::Permissions::from_mode(0o600))?;
     let wanted = xattrs(from)?;
     for (name, value) in xattrs(to)? {
@@ -189,8 +168,6 @@ pub fn copy_metadata(from: &Path, to: &Path) -> io::Result<()> {
     set_times(to, &meta)
 }
 
-/// Set `to`'s mode and mtime from a recorded fingerprint (hardlink-mode undo, where the target's
-/// own metadata was replaced by the keeper's).
 pub fn set_mode_and_mtime(to: &Path, mode: u32, mtime_ns: i64) -> io::Result<()> {
     fs::set_permissions(to, fs::Permissions::from_mode(mode & 0o7777))?;
     let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns.max(0) as u64);
@@ -201,7 +178,6 @@ fn set_times(to: &Path, meta: &fs::Metadata) -> io::Result<()> {
     File::open(to)?.set_times(FileTimes::new().set_accessed(meta.accessed()?).set_modified(meta.modified()?))
 }
 
-/// Every xattr on `path` (nofollow) except the kernel-owned ones.
 pub fn xattrs(path: &Path) -> io::Result<BTreeMap<std::ffi::OsString, Vec<u8>>> {
     let mut out = BTreeMap::new();
     for name in xattr::list(path)? {
@@ -215,7 +191,6 @@ pub fn xattrs(path: &Path) -> io::Result<BTreeMap<std::ffi::OsString, Vec<u8>>> 
     Ok(out)
 }
 
-/// A real, unshared byte copy: create `dst` O_EXCL, read/write loop with an 8 MiB buffer.
 /// Never `std::fs::copy`: on macOS it uses fclonefileat and would produce a clone.
 pub fn real_copy(src: &Path, dst: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
@@ -238,8 +213,6 @@ pub fn fsync(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// True if the file itself (not a symlink target) carries an extended ACL. clonefile would give the
-/// temp the keeper's ACL, and onemodel does not copy ACLs, so such members are refused.
 pub fn has_acl(path: &Path) -> io::Result<bool> {
     #[cfg(target_os = "macos")]
     {
@@ -281,14 +254,8 @@ pub struct Holder {
     pub command: String,
 }
 
-/// Which of `paths` are open or mmapped by any process we can see.
-///
-/// One `lsof -w -n -P -F pcin -- <paths...>` invocation (fds and memory maps both report). Files
-/// are matched by inode, because lsof prints kernel paths (`/private/var/...`) that need not match
-/// ours. lsof exits 1 whenever any named file is not open, so exit 0 or 1 with empty stderr ->
-/// parse stdout; anything else (missing binary, signal, other exit code, stderr output,
-/// unparseable field) -> `Err(detail)`, which every caller turns into a refusal. Fail closed.
 pub fn open_holders(lsof: &Path, paths: &[&Path]) -> Result<BTreeMap<PathBuf, Vec<Holder>>, String> {
+    // Matched by inode, because lsof prints kernel paths (`/private/var/...`) that need not match ours.
     let mut by_ino: BTreeMap<u64, Vec<&Path>> = BTreeMap::new();
     for p in paths {
         let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot stat {}: {e}", p.display()))?;
@@ -304,6 +271,7 @@ pub fn open_holders(lsof: &Path, paths: &[&Path]) -> Result<BTreeMap<PathBuf, Ve
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("cannot run {}: {e}", lsof.display()))?;
+    // lsof exits 1 whenever any named file is not open.
     if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(format!("{} failed ({})", lsof.display(), out.status));
     }
@@ -338,7 +306,6 @@ pub fn open_holders(lsof: &Path, paths: &[&Path]) -> Result<BTreeMap<PathBuf, Ve
     Ok(found)
 }
 
-/// flock(LOCK_EX | LOCK_NB). `Ok(false)` = someone else holds it.
 pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
     // SAFETY: the descriptor is open for the duration of the call.
@@ -350,8 +317,6 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
 }
 
-/// Where the journal lives without `--state`: macOS `~/Library/Application Support/onemodel`,
-/// Linux `$XDG_STATE_HOME/onemodel` (when absolute) or `~/.local/state/onemodel`.
 pub fn default_state_dir(home: &Path, xdg_state_home: Option<&str>) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -367,7 +332,6 @@ pub fn default_state_dir(home: &Path, xdg_state_home: Option<&str>) -> PathBuf {
     }
 }
 
-/// The per-user cache directory: macOS `~/Library/Caches`, Linux `~/.cache`.
 pub fn user_cache_dir(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -379,7 +343,6 @@ pub fn user_cache_dir(home: &Path) -> PathBuf {
     }
 }
 
-/// The lsof to run when `ONEMODEL_LSOF` is unset: `/usr/sbin/lsof` on macOS, `lsof` on PATH on Linux.
 pub fn default_lsof() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -396,7 +359,6 @@ pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// `kill(getpid(), SIGKILL)`. Used only by `journal::crash_point`.
 pub fn sigkill_self() -> ! {
     // SAFETY: kill and getpid have no memory-safety preconditions.
     unsafe {

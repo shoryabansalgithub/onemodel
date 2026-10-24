@@ -1,6 +1,3 @@
-//! The four commands, each a short straight-line function over stores -> matching -> plan ->
-//! journal -> replace. Reports are plain data; `main` renders them.
-
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -19,12 +16,9 @@ use crate::{Env, Exit, Report, fmt_bytes, plural};
 pub struct ScanReport {
     pub stores: Vec<Store>,
     pub groups: Vec<GroupPlan>,
-    /// Sum of target sizes: what `dedupe` would free if every op succeeds.
     pub reclaimable: u64,
     pub unreadable: Vec<Unreadable>,
-    /// Runs with ops still managed, for `undo --run`.
     pub runs: Vec<RunSummary>,
-    /// Set when a dedupe was interrupted: the next `dedupe` resumes it.
     pub interrupted: Option<RunId>,
 }
 
@@ -35,8 +29,6 @@ pub struct RunSummary {
     pub managed_bytes: u64,
 }
 
-/// discover -> find_duplicates -> make_plan(Clone). Takes the journal lock so it never sees a
-/// half-appended run. Identical code path to `dedupe --dry-run` up to rendering.
 pub fn scan(env: &Env) -> anyhow::Result<ScanReport> {
     let journal = Journal::open(&env.state_dir())?;
     let runs = journal.runs()?;
@@ -72,14 +64,10 @@ fn fresh_plan(env: &Env, mode: Mode, runs: &[RunLog]) -> anyhow::Result<Plan> {
 pub struct DedupeReport {
     pub run: Option<RunId>,
     pub dry_run: bool,
-    /// True when this invocation continued an interrupted run instead of planning a new one.
     pub resumed: bool,
     pub mode: Mode,
-    /// The plan executed (or that would be, for --dry-run), including plan-time refusals.
     pub plan: Plan,
-    /// One per op, in op order.
     pub results: Vec<OpResult>,
-    /// Measured: statfs free bytes per volume, plan time vs end of run.
     pub space: Vec<SpaceDelta>,
 }
 
@@ -105,7 +93,6 @@ pub struct SpaceDelta {
     pub free_after: u64,
 }
 
-/// Pairs each volume's earlier free space with `free_after`, measured in the same order.
 fn space_deltas(volumes: &[Volume], free_after: &[(u64, u64)]) -> Vec<SpaceDelta> {
     volumes
         .iter()
@@ -114,21 +101,6 @@ fn space_deltas(volumes: &[Volume], free_after: &[(u64, u64)]) -> Vec<SpaceDelta
         .collect()
 }
 
-/// ```text
-/// journal = Journal::open(state_dir)                      // lock
-/// if an un-ended run exists:                              // resume, whatever flags were passed
-///     dry_run  -> report "would resume run X", change nothing
-///     else     -> writer = reopen(run); execute(run.plan, run.ops)
-/// else:
-///     plan = make_plan(discover(), find_duplicates(), mode, managed(runs))
-///     dry_run or no ops -> report, write nothing
-///     (writer, run) = journal.begin(plan)                  // Plan record durable
-///     crash_point(AfterPlan)
-///     execute(plan, all Pending)
-/// execute = for op in plan.ops(): replace::drive(op, state[op])   // recovery is inside drive
-///           crash_point(BeforeEnd); append End{free_after}
-/// ```
-/// A resumed run reports `free_before` from its plan, so the measured savings cover the whole run.
 pub fn dedupe(env: &Env, mode: Mode, dry_run: bool) -> anyhow::Result<DedupeReport> {
     let journal = Journal::open(&env.state_dir())?;
     let runs = journal.runs()?;
@@ -187,7 +159,6 @@ fn execute(env: &Env, run: &RunLog, writer: &mut RunWriter, resumed: bool) -> an
     })
 }
 
-/// (dev, free bytes) for every volume, in order.
 fn measure(volumes: &[Volume]) -> anyhow::Result<Vec<(u64, u64)>> {
     volumes.iter().map(|v| Ok((v.dev, platform::free_bytes(&v.mount)?))).collect()
 }
@@ -205,14 +176,6 @@ pub struct UndoResult {
     pub result: OpResult,
 }
 
-/// ```text
-/// journal = open; runs = journal.runs()
-/// for each un-ended run (interrupted dedupe): settle in-flight ops with replace::settle
-///     (Staged -> Done or Refused; Pending left Pending, its temp removed), append End.
-/// for run in runs newest-first (or only --run), ops in reverse order, targets under --only:
-///     replace::drive_undo(op, state)    // lsof and free-space checks -> UndoRefused
-/// ```
-/// Idempotent: a second `undo` finds every op Undone and does nothing.
 pub fn undo(env: &Env, run: Option<RunId>, only: &[PathBuf]) -> anyhow::Result<UndoReport> {
     let journal = Journal::open(&env.state_dir())?;
     let runs = journal.runs()?;
@@ -258,67 +221,28 @@ pub fn undo(env: &Env, run: Option<RunId>, only: &[PathBuf]) -> anyhow::Result<U
 
 #[derive(Serialize)]
 pub struct VerifyReport {
-    /// Managed files (and their keepers) whose full content was hashed.
     pub checked_files: u32,
     pub checked_bytes: u64,
-    /// Store roots whose claims were checked, and how many claims in total.
     pub stores: u32,
     pub claims: u32,
     pub problems: Vec<Problem>,
-    /// Managed files an app has since replaced (new inode). Informational: no longer ours.
     pub released: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Problem {
-    /// A managed file or its keeper no longer hashes to the planned content (in-place write).
-    ContentChanged {
-        path: PathBuf,
-    },
-    Missing {
-        path: PathBuf,
-    },
-    Unreadable {
-        path: PathBuf,
-        error: String,
-    },
-    /// A dedupe was interrupted; run `onemodel dedupe` to finish it or `onemodel undo`.
-    Interrupted {
-        run: RunId,
-    },
-    /// A store's metadata names a file that is not there (or is not a regular file).
-    ClaimMissing {
-        store: String,
-        path: PathBuf,
-    },
-    ClaimSizeMismatch {
-        store: String,
-        path: PathBuf,
-        expected: u64,
-        actual: u64,
-    },
-    ClaimDigestMismatch {
-        store: String,
-        path: PathBuf,
-    },
-    /// A snapshot symlink no longer leads to a regular file.
-    LinkBroken {
-        store: String,
-        link: PathBuf,
-    },
-    /// The store's own metadata could not be read or parsed.
-    ClaimsUnreadable {
-        store: String,
-        root: PathBuf,
-        error: String,
-    },
+    ContentChanged { path: PathBuf },
+    Missing { path: PathBuf },
+    Unreadable { path: PathBuf, error: String },
+    Interrupted { run: RunId },
+    ClaimMissing { store: String, path: PathBuf },
+    ClaimSizeMismatch { store: String, path: PathBuf, expected: u64, actual: u64 },
+    ClaimDigestMismatch { store: String, path: PathBuf },
+    LinkBroken { store: String, link: PathBuf },
+    ClaimsUnreadable { store: String, root: PathBuf, error: String },
 }
 
-/// Managed files: for every `journal::managed` entry whose target still has its post-rename inode,
-/// full BLAKE3 of target and (once per keeper) keeper equals the planned hash.
-/// Stores: every claim of every store root holds. A claimed sha256 is checked for files onemodel
-/// manages, and for every claimed file with `deep`. Exit 2 if `problems` is non-empty.
 pub fn verify(env: &Env, deep: bool) -> anyhow::Result<VerifyReport> {
     let journal = Journal::open(&env.state_dir())?;
     let runs = journal.runs()?;
@@ -599,7 +523,6 @@ fn count_roles(groups: &[GroupPlan], f: impl Fn(&Role) -> bool) -> usize {
     groups.iter().flat_map(|g| &g.members).filter(|m| f(&m.role)).count()
 }
 
-/// ` (3 to clone, 1 refused, 2 already shared)`, leaving out zero counts.
 fn tally(groups: &[GroupPlan]) -> String {
     let parts: Vec<String> = [
         (count_roles(groups, |r| matches!(r, Role::Target { .. })), "to clone"),
@@ -613,8 +536,6 @@ fn tally(groups: &[GroupPlan]) -> String {
     if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }
 }
 
-/// One line per volume from statfs: `freed 4.37 GB on / (free 112.40 GB -> 116.77 GB)`, or
-/// `used` when free space fell.
 fn space_text(env: &Env, space: &[SpaceDelta]) -> String {
     space
         .iter()

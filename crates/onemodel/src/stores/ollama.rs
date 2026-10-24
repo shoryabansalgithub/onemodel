@@ -1,9 +1,3 @@
-//! Ollama: `$OLLAMA_MODELS` or `~/.ollama/models`.
-//!
-//! `blobs/sha256-<64hex>` is content-addressed; `manifests/<registry>/<ns>/<model>/<tag>` is JSON
-//! listing `config` and `layers[]`, each with a `digest` and `size`. Pulls write
-//! `blobs/sha256-<hex>-partial[-N]`.
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +21,6 @@ impl StoreKind for Ollama {
         }
     }
 
-    /// Manifests are tiny JSON and must never be touched, so only blobs are candidates.
     fn classify(&self, rel: &Path) -> Entry {
         let mut parts = rel.iter().map(|c| c.to_str().unwrap_or(""));
         let (Some("blobs"), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -42,7 +35,6 @@ impl StoreKind for Ollama {
         }
     }
 
-    /// Every digest a manifest names must be a blob of that size and sha256.
     fn claims(&self, root: &Path) -> io::Result<Vec<Claim>> {
         let manifests = root.join("manifests");
         let mut out = Vec::new();

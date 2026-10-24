@@ -1,8 +1,3 @@
-//! llama.cpp `-hf` cache: `$LLAMA_CACHE`, else `~/Library/Caches/llama.cpp` (macOS) or
-//! `~/.cache/llama.cpp` (Linux). Current builds write the Hugging Face hub layout here; older ones
-//! wrote flat `*.gguf` files with `.json` etag sidecars. Downloads in flight end in
-//! `.downloadInProgress`.
-
 use std::io;
 use std::path::{Path, PathBuf};
 

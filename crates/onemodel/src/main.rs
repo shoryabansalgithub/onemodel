@@ -1,18 +1,3 @@
-//! onemodel: one physical copy of each model file across local-AI app stores.
-//!
-//! Module map (call depth from `main` is at most three files: main -> commands -> replace -> platform):
-//!
-//! | module      | owns the knowledge of                                                        |
-//! |-------------|------------------------------------------------------------------------------|
-//! | `main`      | CLI surface, the process environment (`Env`), rendering reports, exit codes   |
-//! | `commands`  | what scan / dedupe / undo / verify do, in terms of the modules below          |
-//! | `stores`    | where each app keeps models, what is a candidate, what means "downloading"    |
-//! | `matching`  | file identity (dev/ino/fingerprint) and content identity (hash pipeline)      |
-//! | `plan`      | keeper choice, per-volume clone sets, preflight refusals (`Refusal`)          |
-//! | `journal`   | the on-disk record format, run files, the lock, replay into op states         |
-//! | `replace`   | the one atomic file swap, its crash recovery, and its inverse (rematerialize) |
-//! | `platform`  | every OS call that differs between macOS and Linux; the only `unsafe`         |
-
 mod commands;
 mod journal;
 mod matching;
@@ -94,22 +79,16 @@ enum Cmd {
     },
 }
 
-/// Everything onemodel reads from the process environment, captured once in `main`.
-/// Stores locate themselves only through this, so tests isolate the binary from the real machine by
-/// setting `HOME` and the store variables, which is exactly what a user's shell does.
 #[derive(Debug, Clone)]
 pub struct Env {
     pub home: PathBuf,
     vars: BTreeMap<String, String>,
-    /// From `--path`, canonicalized. Non-directories are rejected here.
     pub user_paths: Vec<PathBuf>,
     pub min_size: u64,
-    /// From `--state` or `ONEMODEL_STATE`.
     state: Option<PathBuf>,
 }
 
 impl Env {
-    /// Invariant: `home` is absolute; `user_paths` are canonical existing directories.
     pub fn from_process(user_paths: Vec<PathBuf>, min_size: u64, state: Option<PathBuf>) -> anyhow::Result<Env> {
         let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).context("HOME is not set")?;
         let home = PathBuf::from(home);
@@ -133,13 +112,10 @@ impl Env {
         Ok(Env { home, vars, user_paths, min_size, state })
     }
 
-    /// Non-empty value of an environment variable.
     pub fn var(&self, key: &str) -> Option<&str> {
         self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
     }
 
-    /// Where the journal and lock live. `--state` / `ONEMODEL_STATE` wins; else
-    /// [`platform::default_state_dir`].
     pub fn state_dir(&self) -> PathBuf {
         match &self.state {
             Some(dir) => dir.clone(),
@@ -147,13 +123,10 @@ impl Env {
         }
     }
 
-    /// Path of the lsof binary: `ONEMODEL_LSOF` if set, else [`platform::default_lsof`].
     pub fn lsof(&self) -> PathBuf {
         self.var("ONEMODEL_LSOF").map_or_else(platform::default_lsof, PathBuf::from)
     }
 
-    /// `path` for human output: the home directory as `~`, and content digests in blob names
-    /// (40 or more hex digits) cut to their first 12. `--json` always has full paths.
     pub fn show(&self, path: &Path) -> String {
         let full = match path.strip_prefix(&self.home) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
@@ -181,14 +154,11 @@ impl Env {
     }
 }
 
-/// Process exit codes. Refusals are not failures: a dedupe that refused some files exits 0 and says why.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     Ok = 0,
-    /// Operational error: journal unwritable, another onemodel holds the lock, bad arguments.
     Error = 1,
-    /// `verify` found a problem, or `undo` left an op it could not settle.
     Problems = 2,
 }
 
@@ -203,7 +173,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Flat dispatch: build `Env`, call one command, render its report. No logic lives here.
 fn run(cli: Cli) -> anyhow::Result<Exit> {
     let env = Env::from_process(cli.paths, cli.min_size, cli.state)?;
     match cli.cmd {
@@ -230,7 +199,6 @@ const HARDLINK_WARNING: &str = "warning: --hardlink makes every duplicate the sa
 writes to one path, every other path changes too, and each path's own xattrs are replaced by the \
 keeper's. Clones (the default) do not have this problem on APFS, btrfs and XFS.";
 
-/// Every report knows its exit code and both of its renderings, so `run` stays a dispatcher.
 pub trait Report: serde::Serialize {
     fn human(&self, env: &Env) -> String;
     fn exit(&self) -> Exit {
@@ -247,8 +215,6 @@ fn render<R: Report>(env: &Env, json: bool, report: &R) -> anyhow::Result<Exit> 
     Ok(report.exit())
 }
 
-/// "32M" -> 33554432. Plain digits are bytes; K, M, G (optionally followed by "iB" or "B") are
-/// powers of 1024.
 fn parse_size(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
@@ -264,13 +230,11 @@ fn parse_size(s: &str) -> Result<u64, String> {
     n.checked_mul(1 << shift).ok_or_else(|| format!("{s:?} is too large"))
 }
 
-/// `1 file`, `2 files`.
 pub fn plural(n: impl Into<u64>, noun: &str) -> String {
     let n = n.into();
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
 }
 
-/// Human byte count in decimal GB/MB (matches Finder and `df -H`, which is how users check savings).
 pub fn fmt_bytes(n: u64) -> String {
     let f = n as f64;
     if n >= 1_000_000_000 {

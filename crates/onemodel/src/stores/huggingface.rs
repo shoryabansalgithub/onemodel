@@ -1,10 +1,3 @@
-//! Hugging Face hub cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`.
-//!
-//! `models--<org>--<repo>/snapshots/<rev>/<file>` are symlinks into `blobs/`. Newer hubs add a
-//! shared `blobs/<2hex>/<id>` with per-repo blobs as symlinks into it. Only the regular file at
-//! the end of a chain is a candidate; replacing it by rename keeps every symlink valid because
-//! symlinks name paths, not inodes.
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -37,9 +30,6 @@ impl StoreKind for HuggingFace {
     }
 }
 
-/// The hub cache layout, shared with llama.cpp, which writes the same tree.
-/// `models--*/blobs/<id>` and `blobs/<2hex>/<id>` are candidates; `.incomplete` anywhere is a
-/// download in progress; `.lock`, `.refs`, dotfiles and everything else are not ours.
 pub fn hub_classify(rel: &Path) -> Entry {
     let parts: Vec<&str> = rel.iter().map(|c| c.to_str().unwrap_or("")).collect();
     let name = parts.last().copied().unwrap_or("");
@@ -56,7 +46,6 @@ pub fn hub_classify(rel: &Path) -> Entry {
     }
 }
 
-/// Every symlink under `models--*/snapshots/` must resolve to a regular file.
 pub fn snapshot_links(root: &Path) -> io::Result<Vec<Claim>> {
     let mut out = Vec::new();
     for repo in std::fs::read_dir(root)? {

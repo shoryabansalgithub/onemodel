@@ -1,23 +1,3 @@
-//! The journal: the single source of truth for what onemodel has done to the disk.
-//!
-//! Layout under `Env::state_dir()`:
-//! ```text
-//! lock                      flock(LOCK_EX|LOCK_NB) for the whole process; SIGKILL releases it
-//! runs/<run-id>.jsonl       one file per dedupe run, append-only, one `Record` per line
-//! ```
-//!
-//! Write discipline: `RunWriter::append` writes one complete line with a single `write_all` and
-//! then `sync_all` (F_FULLFSYNC on macOS) before returning. A run file appears in `runs/` only by
-//! renaming a fully written and fsynced `.tmp` holding the Plan record, so a run file always starts
-//! with a complete Plan. When any record is observable after a crash, every earlier record is too.
-//!
-//! Read discipline: `replay` parses every line. A final line without its newline is a torn append
-//! (the write never completed, so the action it guarded never started) and is dropped; `reopen`
-//! truncates it away before appending. Any other unparseable line, or an illegal state transition,
-//! is a hard error: we never guess about disk state.
-//!
-//! Undo appends to the run file of the op it reverses, so an op's whole life is in one place.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -31,7 +11,6 @@ use crate::matching::{FileId, Hash};
 use crate::plan::{Plan, Refusal};
 use crate::platform;
 
-/// `<unix-seconds>-<pid>`: sortable by start time, unique per machine (one onemodel at a time).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunId(pub String);
 
@@ -78,57 +57,19 @@ impl std::str::FromStr for RunId {
 
 pub const FORMAT_VERSION: u32 = 1;
 
-/// One journal line. `op` is the plan's op index.
-///
-/// Per-op lifecycle (dedupe):  Pending -> Staged -> Done      (or Pending|Staged -> Refused)
-/// Per-op lifecycle (undo):    Done -> UndoStaged -> Undone   (or Done|UndoStaged -> UndoRefused -> Done)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Record {
-    /// Always the first line. Written before anything on disk changes.
-    Plan {
-        v: u32,
-        run: RunId,
-        plan: Plan,
-    },
-    /// The temp file for `op` is cloned, has the target's metadata, is fsynced and is byte-identical
-    /// to the target. `ino` is the temp's inode. The next disk action is rename(temp, target).
-    /// This is the "journal written (fsynced) before each replace" record.
-    Staged {
-        op: u32,
-        ino: u64,
-    },
-    /// The rename happened and the directory is fsynced. Target now has inode `Staged.ino`.
-    Done {
-        op: u32,
-    },
-    Refused {
-        op: u32,
-        refusal: Refusal,
-    },
-    /// Every op is terminal (Done or Refused) or was left Pending by an aborting `undo`.
-    /// `free_after` is (dev, free bytes) per plan volume.
-    End {
-        free_after: Vec<(u64, u64)>,
-    },
-    /// Undo's independent copy of the target is written, fsynced and compared; `ino` is its inode.
-    UndoStaged {
-        op: u32,
-        ino: u64,
-    },
-    /// Target is an independent file again (or was already: `note` says why no copy was needed).
-    Undone {
-        op: u32,
-        note: Option<String>,
-    },
-    /// Undo could not proceed for this op this time. The op stays Done; the next `undo` retries.
-    UndoRefused {
-        op: u32,
-        refusal: Refusal,
-    },
+    Plan { v: u32, run: RunId, plan: Plan },
+    Staged { op: u32, ino: u64 },
+    Done { op: u32 },
+    Refused { op: u32, refusal: Refusal },
+    End { free_after: Vec<(u64, u64)> },
+    UndoStaged { op: u32, ino: u64 },
+    Undone { op: u32, note: Option<String> },
+    UndoRefused { op: u32, refusal: Refusal },
 }
 
-/// The state of one op after replaying its run file. Derived, never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpState {
     Pending,
@@ -143,21 +84,16 @@ pub enum OpState {
 pub struct RunLog {
     pub id: RunId,
     pub plan: Plan,
-    /// Indexed by op.
     pub ops: Vec<OpState>,
     pub ended: bool,
     pub file: PathBuf,
-    /// Bytes of complete lines; anything after is a torn append.
     valid_len: u64,
 }
 
-/// A file that is currently a clone (or hardlink) made by onemodel: op Done, not Undone.
 #[derive(Debug, Clone)]
 pub struct Managed {
     pub run: RunId,
     pub target: PathBuf,
-    /// Inode the target had right after our rename. If the path now has another inode, an app
-    /// replaced the file and it is no longer ours to verify or undo.
     pub ino: FileId,
     pub keeper: PathBuf,
     pub keeper_id: FileId,
@@ -165,16 +101,12 @@ pub struct Managed {
     pub size: u64,
 }
 
-/// Holds the process-wide lock for its lifetime. Every command that reads or writes runs opens one,
-/// so scan/dedupe/undo/verify never observe each other mid-append.
 pub struct Journal {
     dir: PathBuf,
     _lock: File,
 }
 
 impl Journal {
-    /// mkdir -p, take the lock. A held lock is an error: "another onemodel (pid N) is running".
-    /// The pid is read from the lock file, written after locking, for the message only.
     pub fn open(state_dir: &Path) -> anyhow::Result<Journal> {
         let runs = state_dir.join("runs");
         fs::create_dir_all(&runs).with_context(|| format!("cannot create the journal at {}", runs.display()))?;
@@ -201,8 +133,6 @@ impl Journal {
         self.dir.join("runs")
     }
 
-    /// Every run, oldest first, replayed into op states. Leftover `.tmp` files are runs whose Plan
-    /// never became durable, so nothing on disk changed for them: they are removed.
     pub fn runs(&self) -> anyhow::Result<Vec<RunLog>> {
         let mut runs = Vec::new();
         for entry in fs::read_dir(self.runs_dir())? {
@@ -220,7 +150,6 @@ impl Journal {
         Ok(runs)
     }
 
-    /// Write the Plan record to `runs/<id>.jsonl.tmp`, fsync, rename into place, fsync `runs/`.
     pub fn begin(&self, plan: Plan) -> anyhow::Result<(RunWriter, RunLog)> {
         let id = RunId::new();
         let file = self.runs_dir().join(format!("{id}.jsonl"));
@@ -244,7 +173,6 @@ impl Journal {
         Ok((writer, log))
     }
 
-    /// Append to an existing run (resume, undo), first cutting off any torn final line.
     pub fn reopen(&self, run: &RunLog) -> anyhow::Result<RunWriter> {
         let file = OpenOptions::new().append(true).open(&run.file)?;
         if file.metadata()?.len() != run.valid_len {
@@ -260,8 +188,6 @@ pub struct RunWriter {
 }
 
 impl RunWriter {
-    /// Serialize, append one line, `sync_all`. Returns only once the record is durable.
-    /// An error here aborts the command: we must never act on a record we could not persist.
     pub fn append(&mut self, rec: &Record) -> anyhow::Result<()> {
         let line = record_line(rec)?;
         self.file.write_all(&line).context("cannot write the journal")?;
@@ -270,14 +196,12 @@ impl RunWriter {
     }
 }
 
-/// One journal line: the record's JSON and its newline.
 fn record_line(rec: &Record) -> anyhow::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(rec)?;
     line.push(b'\n');
     Ok(line)
 }
 
-/// Fold one run file's records into op states. Illegal transitions are errors.
 pub fn replay(file: PathBuf, bytes: &[u8]) -> anyhow::Result<RunLog> {
     let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let mut lines = bytes[..complete].split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate();
@@ -336,8 +260,6 @@ pub fn replay(file: PathBuf, bytes: &[u8]) -> anyhow::Result<RunLog> {
     Ok(RunLog { id: run, plan, ops, ended, file, valid_len: complete as u64 })
 }
 
-/// Every file onemodel currently manages, across all runs. An op whose undo is in flight still
-/// counts, with the inode it had after dedupe.
 pub fn managed(runs: &[RunLog]) -> Vec<Managed> {
     let mut out = Vec::new();
     for run in runs {
@@ -360,35 +282,18 @@ pub fn managed(runs: &[RunLog]) -> Vec<Managed> {
     out
 }
 
-/// Named points where the test suite kills the process with a real SIGKILL.
-///
-/// Seam: if `ONEMODEL_CRASH_AT=<point>:<n>` (e.g. `after-staged:2`) and this is the n-th time this
-/// process reaches `<point>`, the process sends itself SIGKILL. No destructors, no flushes, no
-/// unwinding: the same as `kill -9` from outside. Inert when the variable is unset (one env read,
-/// cached in a OnceLock). Kept in release builds on purpose so the tested binary is the shipped one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CrashPoint {
-    /// Plan record durable; nothing on disk changed yet.
     AfterPlan,
-    /// Temp clone exists, metadata not yet applied.
     AfterClone,
-    /// Temp has target's metadata, not yet fsynced or compared.
     AfterMetadata,
-    /// Temp fsynced and byte-compared equal; Staged not yet written.
     AfterCompare,
-    /// Staged durable; rename not yet done.
     AfterStaged,
-    /// Renamed over the target; directory not yet fsynced; Done not yet written.
     AfterRename,
-    /// Done durable.
     AfterDone,
-    /// All ops terminal; End not yet written.
     BeforeEnd,
-    /// Undo: independent copy written to temp; UndoStaged not yet written.
     UndoAfterCopy,
-    /// Undo: UndoStaged durable; rename not yet done.
     UndoAfterStaged,
-    /// Undo: renamed; Undone not yet written.
     UndoAfterRename,
 }
 

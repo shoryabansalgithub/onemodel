@@ -1,12 +1,3 @@
-//! Identity, twice: which inode a path is (`FileId`, `Fingerprint`), and which bytes it holds (`Hash`).
-//!
-//! The public surface is one pipeline function plus two primitives. The stages (size bucket ->
-//! sampled hash -> full BLAKE3) are private: no caller needs to know they exist, and changing the
-//! sampling window cannot leak anywhere.
-//!
-//! Hash equality only *proposes* a duplicate. Nothing in this module decides a replacement; the
-//! byte-for-byte compare that authorizes one happens in `replace`, against the clone itself.
-
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::{File, Metadata};
@@ -19,18 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::stores::{FoundFile, StoreIx};
 
-/// An inode. Two paths with the same `FileId` are one file (hardlinks), never duplicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FileId {
     pub dev: u64,
     pub ino: u64,
 }
 
-/// What lstat said about a path at one instant.
-///
-/// `same_file_unchanged` is the single definition of "this is still the file we planned against".
-/// ctime is included on purpose: chmod, xattr writes, link-count changes and in-place writes all
-/// bump it, and a false "changed" only costs a refusal and a rerun.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     pub id: FileId,
@@ -43,7 +28,6 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
-    /// lstat, never following symlinks.
     pub fn of(path: &Path) -> io::Result<Fingerprint> {
         Ok(Fingerprint::from_metadata(&std::fs::symlink_metadata(path)?))
     }
@@ -65,7 +49,6 @@ impl Fingerprint {
     }
 }
 
-/// BLAKE3 of the full content. Serialized as 64 lowercase hex chars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash(pub [u8; 32]);
 
@@ -103,15 +86,12 @@ pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// One inode and every candidate path that names it (hardlinks collapsed). `paths` sorted.
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub stat: Fingerprint,
     pub paths: Vec<(PathBuf, StoreIx)>,
 }
 
-/// Inodes whose full BLAKE3 hashes are equal. Invariant: `inodes.len() >= 2`, all `stat.size == size`,
-/// sorted by first path. May span volumes; `plan` splits it per volume.
 #[derive(Debug, Clone)]
 pub struct DupGroup {
     pub hash: Hash,
@@ -126,28 +106,13 @@ pub struct Unreadable {
 }
 
 pub struct Matches {
-    /// Sorted by (size descending, hash): biggest savings first, deterministic.
     pub groups: Vec<DupGroup>,
-    /// Files that vanished or failed to read mid-hash. Reported, never fatal.
     pub unreadable: Vec<Unreadable>,
 }
 
-/// Bytes read from each of the head, middle and tail of a file for the sampled hash.
 const SAMPLE: u64 = 1 << 20;
 const BUF: usize = 8 << 20;
 
-/// The matching pipeline.
-///
-/// 1. collapse paths by `FileId`; bucket inodes by size; drop buckets with one inode.
-/// 2. sampled hash = BLAKE3(size_le || head || middle || tail), 1 MiB each (the whole file when it
-///    is at most 3 MiB). GGUF headers are shared across quantizations, so head alone is weak.
-///    Drop singleton sub-buckets.
-/// 3. full BLAKE3 with a read loop (no mmap: a file truncated under a mapping is SIGBUS), files
-///    hashed in parallel on `std::thread::scope` workers (min(available_parallelism, 4)).
-/// 4. group by full hash; drop singletons.
-///
-/// Cost model: every file in a surviving sampled bucket is read fully once. No hash cache in v1:
-/// a cache keyed on fingerprint is a second source of truth for content and the first thing to lie.
 pub fn find_duplicates(files: Vec<FoundFile>) -> Matches {
     let mut by_id: BTreeMap<FileId, Inode> = BTreeMap::new();
     for f in files {
@@ -181,8 +146,6 @@ pub fn find_duplicates(files: Vec<FoundFile>) -> Matches {
     Matches { groups, unreadable }
 }
 
-/// Hash every inode with `key`, then split into buckets of equal (size, key) with at least two
-/// members. Read failures go to `unreadable` and drop the inode.
 fn refine(
     inodes: Vec<Inode>,
     key: impl Fn(&Inode) -> io::Result<Hash> + Sync,
@@ -198,9 +161,6 @@ fn refine(
     buckets.into_values().filter(|b| b.len() >= 2).collect()
 }
 
-/// `f` over every item on up to four workers, results in input order. Workers pull the next index
-/// as they finish, because inputs arrive sorted by size and fixed chunks would give one worker
-/// every large file.
 fn parallel_map<T: Sync + Send, R: Send>(items: Vec<T>, f: impl Fn(&T) -> R + Sync) -> Vec<(T, R)> {
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4).min(items.len());
     let next = AtomicUsize::new(0);
@@ -249,7 +209,6 @@ fn sampled_hash(path: &Path, size: u64) -> io::Result<Hash> {
     Ok(Hash(*hasher.finalize().as_bytes()))
 }
 
-/// Full BLAKE3 of one file.
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
     let mut hasher = blake3::Hasher::new();
     read_chunks(path, |chunk| {
@@ -272,8 +231,6 @@ pub fn read_chunks(path: &Path, mut f: impl FnMut(&[u8])) -> io::Result<()> {
     }
 }
 
-/// Byte-for-byte compare. `Ok(None)` = same length and same bytes; `Ok(Some(off))` = first
-/// differing byte offset (or the shorter length).
 pub fn first_difference(a: &Path, b: &Path) -> io::Result<Option<u64>> {
     let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
     let (mut ba, mut bb) = (vec![0u8; BUF], vec![0u8; BUF]);
@@ -296,7 +253,6 @@ pub fn first_difference(a: &Path, b: &Path) -> io::Result<Option<u64>> {
     }
 }
 
-/// Fill `buf` unless EOF comes first. Returns the bytes read.
 fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
