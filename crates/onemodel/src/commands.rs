@@ -1,19 +1,20 @@
 //! The four commands, each a short straight-line function over stores -> matching -> plan ->
 //! journal -> replace. Reports are plain data; `main` renders them.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use anyhow::bail;
 use serde::Serialize;
 
-use crate::journal::{CrashPoint, Journal, RunId, crash_point};
-use crate::matching::Unreadable;
-use crate::plan::{GroupPlan, Mode, Plan, Refusal};
-use crate::replace::Outcome;
-use crate::stores::Store;
+use crate::journal::{self, CrashPoint, Journal, Record, RunId, RunLog, RunWriter, crash_point};
+use crate::matching::{self, Fingerprint, Unreadable};
+use crate::plan::{self, GroupPlan, Mode, Plan, Refusal, Volume};
+use crate::platform;
+use crate::replace::{self, Ctx, Outcome};
+use crate::stores::{self, Claim, Store};
 use crate::{Env, Exit, Report};
-
-// ---------------------------------------------------------------------------------------------
-// scan
 
 #[derive(Serialize)]
 pub struct ScanReport {
@@ -35,15 +36,39 @@ pub struct RunSummary {
     pub managed_bytes: u64,
 }
 
-/// discover -> find_duplicates -> make_plan(Clone). Takes the journal lock (read-only use) so it
-/// never sees a half-appended run. Identical code path to `dedupe --dry-run` up to rendering.
+/// discover -> find_duplicates -> make_plan(Clone). Takes the journal lock so it never sees a
+/// half-appended run. Identical code path to `dedupe --dry-run` up to rendering.
 pub fn scan(env: &Env) -> anyhow::Result<ScanReport> {
-    let _ = env;
-    todo!()
+    let journal = Journal::open(&env.state_dir())?;
+    let runs = journal.runs()?;
+    let plan = fresh_plan(env, Mode::Clone, &runs)?;
+    let managed = journal::managed(&runs);
+    let summaries = runs
+        .iter()
+        .filter_map(|run| {
+            let mine: Vec<_> = managed.iter().filter(|m| m.run == run.id).collect();
+            (!mine.is_empty()).then(|| RunSummary {
+                id: run.id.clone(),
+                managed_files: mine.len() as u32,
+                managed_bytes: mine.iter().map(|m| m.size).sum(),
+            })
+        })
+        .collect();
+    Ok(ScanReport {
+        stores: plan.stores.clone(),
+        reclaimable: plan.reclaimable(),
+        groups: plan.groups,
+        unreadable: plan.unreadable,
+        runs: summaries,
+        interrupted: runs.iter().find(|r| !r.ended).map(|r| r.id.clone()),
+    })
 }
 
-// ---------------------------------------------------------------------------------------------
-// dedupe
+fn fresh_plan(env: &Env, mode: Mode, runs: &[RunLog]) -> anyhow::Result<Plan> {
+    let inv = stores::discover(env)?;
+    let matches = matching::find_duplicates(inv.files.clone());
+    plan::make_plan(env, inv, matches, mode, &journal::managed(runs))
+}
 
 #[derive(Serialize)]
 pub struct DedupeReport {
@@ -96,8 +121,10 @@ pub fn dedupe(env: &Env, mode: Mode, dry_run: bool) -> anyhow::Result<DedupeRepo
     todo!()
 }
 
-// ---------------------------------------------------------------------------------------------
-// undo
+/// (dev, free bytes) for every volume, in order.
+fn measure(volumes: &[Volume]) -> anyhow::Result<Vec<(u64, u64)>> {
+    volumes.iter().map(|v| Ok((v.dev, platform::free_bytes(&v.mount)?))).collect()
+}
 
 #[derive(Serialize)]
 pub struct UndoReport {
@@ -117,9 +144,6 @@ pub fn undo(env: &Env, run: Option<RunId>) -> anyhow::Result<UndoReport> {
     let _ = (env, run, Refusal::ChangedSinceScan);
     todo!()
 }
-
-// ---------------------------------------------------------------------------------------------
-// verify
 
 #[derive(Serialize)]
 pub struct VerifyReport {
