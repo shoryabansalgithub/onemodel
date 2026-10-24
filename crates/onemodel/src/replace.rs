@@ -252,9 +252,94 @@ fn prepare(cx: &Ctx<'_>, op: &Op<'_>, temp: &Path) -> Result<(), Refusal> {
 }
 
 /// Undo counterpart of [`drive`]. Ops that are Pending/Refused/Undone return without touching disk.
+/// A temp left by a killed undo is removed before any check, so a refusal never strands a copy.
 pub fn drive_undo(cx: &mut Ctx<'_>, op: Op<'_>, state: &OpState) -> anyhow::Result<Option<Outcome>> {
-    let _ = (cx, op, state);
-    todo!("undo recovery table, then rematerialize")
+    let (done_ino, staged_ino) = match state {
+        OpState::Done { ino } => (*ino, None),
+        OpState::UndoStaged { done_ino, ino } => (*done_ino, Some(*ino)),
+        OpState::Pending | OpState::Staged { .. } | OpState::Refused(_) | OpState::Undone => return Ok(None),
+    };
+    if staged_ino.is_some() && target_ino(&op)? == staged_ino {
+        platform::fsync_dir(parent(&op.target.path))?;
+        cx.writer.append(&Record::Undone { op: op.ix, note: None })?;
+        return Ok(Some(Outcome::Restored));
+    }
+    remove_if_present(&undo_temp_path(cx.run, &op))?;
+    undo_done(cx, op, done_ino).map(Some)
+}
+
+fn target_ino(op: &Op<'_>) -> anyhow::Result<Option<u64>> {
+    match Fingerprint::of(&op.target.path) {
+        Ok(fp) if fp.id.dev == op.target.stat.id.dev => Ok(Some(fp.id.ino)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn independent(cx: &mut Ctx<'_>, op: &Op<'_>, now: Option<u64>) -> anyhow::Result<Outcome> {
+    let note = if now.is_some() { "replaced by another file since dedupe" } else { "missing" }.to_string();
+    cx.writer.append(&Record::Undone { op: op.ix, note: Some(note.clone()) })?;
+    Ok(Outcome::AlreadyIndependent { note })
+}
+
+fn undo_refuse(cx: &mut Ctx<'_>, op: &Op<'_>, refusal: Refusal) -> anyhow::Result<Outcome> {
+    cx.writer.append(&Record::UndoRefused { op: op.ix, refusal: refusal.clone() })?;
+    Ok(Outcome::Refused { refusal })
+}
+
+fn undo_done(cx: &mut Ctx<'_>, op: Op<'_>, done_ino: u64) -> anyhow::Result<Outcome> {
+    let now = target_ino(&op)?;
+    if now != Some(done_ino) {
+        return independent(cx, &op, now);
+    }
+    if let Err(refusal) = open_check(cx.lsof, &op.target.path) {
+        return undo_refuse(cx, &op, refusal);
+    }
+    let available = platform::free_bytes(parent(&op.target.path))?;
+    if available < op.size {
+        return undo_refuse(cx, &op, Refusal::NotEnoughSpace { needed: op.size, available });
+    }
+    let temp = undo_temp_path(cx.run, &op);
+    if let Err(refusal) = rematerialize(cx, &op, &temp) {
+        remove_if_present(&temp)?;
+        return undo_refuse(cx, &op, refusal);
+    }
+    let ino = Fingerprint::of(&temp)?.id.ino;
+    cx.writer.append(&Record::UndoStaged { op: op.ix, ino })?;
+    crash_point(CrashPoint::UndoAfterStaged);
+    let now = target_ino(&op)?;
+    if now != Some(done_ino) {
+        remove_if_present(&temp)?;
+        return independent(cx, &op, now);
+    }
+    if let Err(e) = fs::rename(&temp, &op.target.path) {
+        remove_if_present(&temp)?;
+        return undo_refuse(cx, &op, io_refusal("rename", e));
+    }
+    crash_point(CrashPoint::UndoAfterRename);
+    platform::fsync_dir(parent(&op.target.path))?;
+    cx.writer.append(&Record::Undone { op: op.ix, note: None })?;
+    Ok(Outcome::Restored)
+}
+
+/// An independent copy of the target's current bytes and metadata at `temp`, fsynced and compared.
+/// In hardlink mode the target's own inode is the keeper's, so mode and mtime come from the plan.
+fn rematerialize(cx: &Ctx<'_>, op: &Op<'_>, temp: &Path) -> Result<(), Refusal> {
+    platform::real_copy(&op.target.path, temp).map_err(|e| io_refusal("copy", e))?;
+    platform::copy_metadata(&op.target.path, temp).map_err(|e| io_refusal("metadata copy", e))?;
+    if cx.mode == Mode::Hardlink {
+        platform::set_mode_and_mtime(temp, op.target.stat.mode, op.target.stat.mtime_ns)
+            .map_err(|e| io_refusal("metadata copy", e))?;
+    }
+    platform::fsync_file(temp).map_err(|e| io_refusal("fsync", e))?;
+    match first_difference(temp, &op.target.path) {
+        Ok(None) => {}
+        Ok(Some(offset)) => return Err(Refusal::ContentMismatch { offset }),
+        Err(e) => return Err(io_refusal("compare", e)),
+    }
+    crash_point(CrashPoint::UndoAfterCopy);
+    Ok(())
 }
 
 fn io_refusal(step: &str, e: io::Error) -> Refusal {
