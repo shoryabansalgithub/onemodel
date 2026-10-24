@@ -526,3 +526,132 @@ fn hardlink_mode_warns_and_links_and_undo_unlinks() {
         |d: &Disk| d.0.iter().map(|l| l.split(" xattrs=").next().unwrap().to_string()).collect::<Vec<_>>();
     assert_eq!(without_xattrs(&disk(&fx)), without_xattrs(&before));
 }
+
+/// A child process holding `path` open on fd 3. Killed on drop.
+struct Holder(Child);
+
+impl Holder {
+    fn open(path: &Path) -> Holder {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec 3<\"$1\"; echo ready; exec sleep 600", "sh"])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        Holder(child)
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn member<'a>(fx: &Fixture, groups: &'a Value, rel: &str) -> &'a Value {
+    groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["members"].as_array().unwrap())
+        .find(|m| fx.name(m["path"].as_str().unwrap()) == rel)
+        .unwrap()
+}
+
+#[test]
+fn refuses_file_open_by_a_process() {
+    let Some(fx) = Fixture::new() else { return };
+    let original = fs::metadata(fx.path(OLLAMA_A)).unwrap().ino();
+    let holder = Holder::open(&fx.path(OLLAMA_A));
+    let report = fx.json(&["dedupe"]);
+    let m = member(&fx, &report["plan"]["groups"], OLLAMA_A);
+    assert_eq!(m["role"], json!("refused"));
+    assert_eq!(
+        m["refusal"],
+        json!({"reason": "open_by_process", "holders": [{"pid": holder.0.id(), "command": "sleep"}]})
+    );
+    assert_eq!(report["results"].as_array().unwrap().len(), 5);
+    assert_eq!(fs::metadata(fx.path(OLLAMA_A)).unwrap().ino(), original);
+
+    drop(holder);
+    assert_eq!(fx.outcomes(&fx.json(&["dedupe"])), pairs(&[(OLLAMA_A, "replaced")]));
+}
+
+#[test]
+fn undo_refuses_open_file_and_only_limits_scope() {
+    let Some(fx) = Fixture::new() else { return };
+    let before = disk(&fx);
+    fx.json(&["dedupe"]);
+    let only = fx.home.join(".ollama").display().to_string();
+    let undo = fx.json(&["undo", "--only", &only]);
+    assert_eq!(fx.outcomes(&undo), pairs(&[(OLLAMA_A, "restored")]));
+
+    let holder = Holder::open(&fx.path(HF_C));
+    let undo = fx.json_code(&["undo"], 2);
+    assert_eq!(
+        fx.outcomes(&undo),
+        pairs(&[
+            (LLAMA_A, "restored"),
+            (HF_A, "restored"),
+            (LLAMA_B, "restored"),
+            (EXTRA_B, "restored"),
+            (HF_C, "refused:open_by_process")
+        ])
+    );
+    drop(holder);
+    assert_eq!(fx.outcomes(&fx.json(&["undo"])), pairs(&[(HF_C, "restored")]));
+    assert_eq!(fx.json(&["undo"])["results"], json!([]));
+    assert_eq!(disk(&fx), before);
+    assert_eq!(fx.roles(&fx.json(&["scan"])["groups"]), fresh_roles());
+}
+
+#[test]
+fn refuses_everything_when_lsof_cannot_run() {
+    let Some(fx) = Fixture::new() else { return };
+    let before = disk(&fx);
+    let out = fx.run_env(&["--json", "dedupe"], &[("ONEMODEL_LSOF", "/nonexistent/lsof")]);
+    assert!(out.status.success(), "{}", text(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let expected: Vec<(String, String)> = fresh_roles()
+        .into_iter()
+        .map(|(p, r)| (p, if r == "target" { "refused:open_check_failed".to_string() } else { r }))
+        .collect();
+    assert_eq!(fx.roles(&report["plan"]["groups"]), expected);
+    assert_eq!(report["results"], json!([]));
+    assert_eq!(disk(&fx), before);
+    assert_eq!(fx.run_files(), Vec::<String>::new());
+}
+
+#[test]
+fn lmstudio_downloads_folder_from_settings_is_a_store() {
+    let Some(fx) = Fixture::new() else { return };
+    let folder = fx.home.join("lms-downloads");
+    put(&folder.join("pub/repo/a-copy.gguf"), &content("A"), 0o644, 1_700_000_070, None);
+    let settings = json!({"downloadsFolder": folder, "other": 1});
+    put(&fx.home.join(".lmstudio/settings.json"), settings.to_string().as_bytes(), 0o644, 1_700_000_071, None);
+    let scan = fx.json(&["scan"]);
+    let roots: Vec<String> = scan["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] == json!("lmstudio"))
+        .map(|s| fx.name(s["root"].as_str().unwrap()))
+        .collect();
+    assert_eq!(roots, [".lmstudio/models", "lms-downloads"]);
+    assert_eq!(member(&fx, &scan["groups"], "lms-downloads/pub/repo/a-copy.gguf")["role"], json!("target"));
+}
+
+#[test]
+fn undo_rejects_an_unknown_run() {
+    let Some(fx) = Fixture::new() else { return };
+    fx.json(&["dedupe"]);
+    let out = fx.run(&["undo", "--run", "1-1"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "onemodel: no run 1-1 in the journal\n");
+    let run = fx.json(&["scan"])["runs"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(fx.outcomes(&fx.json(&["undo", "--run", &run])).len(), 6);
+}
