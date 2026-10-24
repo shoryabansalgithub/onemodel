@@ -38,7 +38,7 @@ $ onemodel dedupe
 replaced  ~/.lmstudio/models/bartowski/SmolLM2-360M-Instruct-GGUF/SmolLM2-360M-Instruct-Q4_K_M.gguf  (clone of ~/.cache/huggingface/hub/blobs/47/4788feabb162…)
 replaced  ~/.ollama/models/blobs/sha256-2fa3f013dcdd…  (clone of ~/.cache/huggingface/hub/blobs/47/4788feabb162…)
 replaced  ~/Library/Caches/llama.cpp/models--bartowski--SmolLM2-360M-Instruct-GGUF/blobs/2fa3f013dcdd…  (clone of ~/.cache/huggingface/hub/blobs/47/4788feabb162…)
-freed 810.4 MB on /System/Volumes/Data (free 151.44 GB -> 152.25 GB)
+freed 811.8 MB on /System/Volumes/Data (free 150.89 GB -> 151.70 GB)
 
 $ onemodel verify
 ok: 4 managed files (1.08 GB) hashed, 23 store claims checked in 4 stores
@@ -47,7 +47,7 @@ $ onemodel undo
 restored  ~/Library/Caches/llama.cpp/models--bartowski--SmolLM2-360M-Instruct-GGUF/blobs/2fa3f013dcdd…
 restored  ~/.ollama/models/blobs/sha256-2fa3f013dcdd…
 restored  ~/.lmstudio/models/bartowski/SmolLM2-360M-Instruct-GGUF/SmolLM2-360M-Instruct-Q4_K_M.gguf
-used 813.5 MB on /System/Volumes/Data (free 152.25 GB -> 151.43 GB)
+used 811.5 MB on /System/Volumes/Data (free 151.70 GB -> 150.89 GB)
 ```
 
 | Command | What it does |
@@ -81,7 +81,7 @@ All numbers come from one MacBook (Apple silicon, APFS, warm page cache), measur
 
 | Setup | Stores | Duplicates found | Reclaimed | `scan` | `dedupe` | `undo` |
 | --- | --- | --- | --- | --- | --- | --- |
-| SmolLM2-360M Q4_K_M (270.6 MB) installed by Ollama, Hugging Face, LM Studio and llama.cpp | 4 | 3 | 0.81 GB | 0.43 s | 1.11 s | 0.82 s |
+| SmolLM2-360M Q4_K_M (270.6 MB) installed by Ollama, Hugging Face, LM Studio and llama.cpp | 4 | 3 | 0.81 GB | 0.50 s | 1.35 s | 0.97 s |
 | Qwen2.5-3B Q4_K_M (1.93 GB), two copies in two `--path` folders | 2 | 1 | 1.93 GB | 2.47 s | 3.57 s | 1.75 s |
 
 After the first row's dedupe, `ollama run` on both Ollama model names and `llama-completion` on the LM Studio, Hugging Face and llama.cpp paths each loaded the shared file and answered "Paris" to "The capital of France is", with temperature 0. They gave the same answer again after `undo`.
