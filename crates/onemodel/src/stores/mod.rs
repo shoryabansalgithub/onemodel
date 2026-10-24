@@ -26,8 +26,12 @@ mod lmstudio;
 mod ollama;
 mod user;
 
+use std::collections::BTreeSet;
+use std::fs::Metadata;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::Env;
@@ -86,6 +90,9 @@ pub struct Store {
     pub root: PathBuf,
     /// First in-progress file found under `root`, if any. `Some` means the app is mid-download.
     pub downloading: Option<PathBuf>,
+    /// Candidate files at or above the minimum size, and their total size.
+    pub files: u32,
+    pub bytes: u64,
 }
 
 /// A candidate file, already lstat'ed. Paths are absolute and unique across the inventory.
@@ -112,21 +119,57 @@ pub struct IntactProblem {
 ///
 /// Invariants of the result:
 /// - only regular files (lstat, never following symlinks) with size >= `env.min_size`;
-/// - each canonical path appears once, attributed to the first registry kind that claims it;
-/// - files named `.onemodel-*.tmp` are never returned and never mark a store as downloading;
+/// - each canonical path appears once, attributed to the first registry kind whose root holds it;
+/// - files named `.onemodel-*` are never returned and never mark a store as downloading;
 /// - `stores` order is registry order, then root order: deterministic for a given machine state.
 pub fn discover(env: &Env) -> anyhow::Result<Inventory> {
-    let _ = env;
-    // TODO: for kind in REGISTRY, for root in kind.roots(env) that is an existing dir (dedupe by
-    //       canonical path): walk(root) -> classify each regular file -> collect Candidates, record
-    //       first InProgress as `downloading`.
-    todo!()
+    let mut inv = Inventory { stores: Vec::new(), files: Vec::new() };
+    let mut files_seen = BTreeSet::new();
+    for (kind, root) in locate(env) {
+        let ix = StoreIx(u16::try_from(inv.stores.len()).context("too many stores")?);
+        let mut store =
+            Store { kind: kind.name().to_string(), root: root.clone(), downloading: None, files: 0, bytes: 0 };
+        for (path, rel, meta) in walk(&root) {
+            if !files_seen.insert(path.clone()) {
+                continue;
+            }
+            match kind.classify(&rel) {
+                Entry::InProgress => {
+                    store.downloading.get_or_insert(path);
+                }
+                Entry::Candidate if meta.len() >= env.min_size => {
+                    store.files += 1;
+                    store.bytes += meta.len();
+                    inv.files.push(FoundFile { path, store: ix, stat: Fingerprint::from_metadata(&meta) });
+                }
+                Entry::Candidate | Entry::Ignore => {}
+            }
+        }
+        inv.stores.push(store);
+    }
+    Ok(inv)
+}
+
+/// Every store root that exists on this machine, canonical and unique, in registry then root order.
+pub fn locate(env: &Env) -> Vec<(&'static dyn StoreKind, PathBuf)> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for &kind in REGISTRY {
+        for root in kind.roots(env) {
+            let Ok(root) = std::fs::canonicalize(&root) else { continue };
+            if root.is_dir() && seen.insert(root.clone()) {
+                out.push((kind, root));
+            }
+        }
+    }
+    out
 }
 
 /// Re-check a store for an in-progress download right before touching any of its files.
 /// A pull can start between plan and execute; this is the cheap metadata-only walk.
 pub fn downloading_now(store: &Store) -> anyhow::Result<Option<PathBuf>> {
-    todo!("walk({:?}), first file classified InProgress", store.root)
+    let kind = kind_by_name(&store.kind).with_context(|| format!("unknown store kind {:?}", store.kind))?;
+    Ok(walk(&store.root).find(|(_, rel, _)| kind.classify(rel) == Entry::InProgress).map(|(path, _, _)| path))
 }
 
 /// Look up a registered kind by its stable name (from a journal written by an older run).
@@ -138,9 +181,22 @@ pub fn kind_by_name(name: &str) -> Option<&'static dyn StoreKind> {
 /// files only, skipping onemodel temp files. Unreadable subdirectories are skipped with a warning
 /// on stderr, never fatal: a store we cannot fully read is still safe to partially dedupe because
 /// every replace revalidates its own target.
-fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, PathBuf, std::fs::Metadata)> {
-    let _ = root;
-    std::iter::from_fn(|| todo!())
+fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, PathBuf, Metadata)> + '_ {
+    walkdir::WalkDir::new(root).follow_links(false).sort_by_file_name().into_iter().filter_map(move |entry| {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("onemodel: skipping part of {}: {e}", root.display());
+                return None;
+            }
+        };
+        if !entry.file_type().is_file() || entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+            return None;
+        }
+        let meta = entry.metadata().ok()?;
+        let rel = entry.path().strip_prefix(root).ok()?.to_path_buf();
+        Some((entry.into_path(), rel, meta))
+    })
 }
 
 /// Suffixes that mean "a download is still being written" across apps whose exact convention is
