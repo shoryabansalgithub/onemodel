@@ -153,7 +153,6 @@ pub struct RunLog {
 #[derive(Debug, Clone)]
 pub struct Managed {
     pub run: RunId,
-    pub op: u32,
     pub target: PathBuf,
     /// Inode the target had right after our rename. If the path now has another inode, an app
     /// replaced the file and it is no longer ours to verify or undo.
@@ -161,6 +160,7 @@ pub struct Managed {
     pub keeper: PathBuf,
     pub keeper_id: FileId,
     pub hash: Hash,
+    pub size: u64,
 }
 
 /// Holds the process-wide lock for its lifetime. Every command that reads or writes runs opens one,
@@ -329,10 +329,28 @@ pub fn replay(file: PathBuf, bytes: &[u8]) -> anyhow::Result<RunLog> {
     Ok(RunLog { id: run, plan, ops, ended, file, valid_len: complete as u64 })
 }
 
-/// Every file onemodel currently manages, across all runs.
+/// Every file onemodel currently manages, across all runs. An op whose undo is in flight still
+/// counts, with the inode it had after dedupe.
 pub fn managed(runs: &[RunLog]) -> Vec<Managed> {
-    let _ = runs;
-    todo!()
+    let mut out = Vec::new();
+    for run in runs {
+        for op in run.plan.ops() {
+            let ino = match run.ops[op.ix as usize] {
+                OpState::Done { ino } | OpState::UndoStaged { done_ino: ino, .. } => ino,
+                _ => continue,
+            };
+            out.push(Managed {
+                run: run.id.clone(),
+                target: op.target.path.clone(),
+                ino: FileId { dev: op.target.stat.id.dev, ino },
+                keeper: op.keeper.path.clone(),
+                keeper_id: op.keeper.stat.id,
+                hash: op.hash,
+                size: op.size,
+            });
+        }
+    }
+    out
 }
 
 /// Named points where the test suite kills the process with a real SIGKILL.
