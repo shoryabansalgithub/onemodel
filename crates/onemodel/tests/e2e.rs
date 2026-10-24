@@ -662,6 +662,26 @@ fn undo_refuses_open_file_and_only_limits_scope() {
     assert_eq!(fx.roles(&fx.json(&["scan"])["groups"]), fresh_roles());
 }
 
+/// A killed undo leaves a full-size copy behind; a rerun that refuses the file must still remove it.
+#[test]
+fn undo_refused_after_a_crash_leaves_no_temp_copy() {
+    let Some(fx) = Fixture::new() else { return };
+    fx.json(&["dedupe"]);
+    killed(&fx, &["undo"], "undo-after-copy:1");
+    let temp = disk(&fx).0.into_iter().find(|l| l.contains(".onemodel-")).expect("the killed undo left its copy");
+    let dir = temp.split_whitespace().nth(1).unwrap().rsplit_once('/').unwrap().0.to_string();
+    let target = [OLLAMA_A, LLAMA_A, HF_A, LLAMA_B, EXTRA_B, HF_C]
+        .into_iter()
+        .find(|t| t.rsplit_once('/').unwrap().0 == dir)
+        .unwrap();
+    let holder = Holder::open(&fx.path(target));
+    let undo = fx.json_code(&["undo"], 2);
+    assert_eq!(fx.outcomes(&undo).iter().filter(|(_, o)| o == "refused:open_by_process").count(), 1);
+    let temps: Vec<String> = disk(&fx).0.into_iter().filter(|l| l.contains(".onemodel-")).collect();
+    assert_eq!(temps, Vec::<String>::new());
+    drop(holder);
+}
+
 #[test]
 fn refuses_everything_when_lsof_cannot_run() {
     let Some(fx) = Fixture::new() else { return };
@@ -882,4 +902,134 @@ fn second_instance_is_rejected() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("another onemodel"), "{}", text(&out));
     assert_eq!(fx.run_files(), Vec::<String>::new());
+}
+
+const DEDUPE_POINTS: [(&str, u32); 8] = [
+    ("after-plan", 1),
+    ("after-clone", 6),
+    ("after-metadata", 6),
+    ("after-compare", 6),
+    ("after-staged", 6),
+    ("after-rename", 6),
+    ("after-done", 6),
+    ("before-end", 1),
+];
+
+const UNDO_POINTS: [(&str, u32); 3] = [("undo-after-copy", 6), ("undo-after-staged", 6), ("undo-after-rename", 6)];
+
+fn cases(points: &[(&str, u32)]) -> Vec<String> {
+    points.iter().flat_map(|(p, hits)| (1..=*hits).map(move |n| format!("{p}:{n}"))).collect()
+}
+
+/// Run `case` for every crash spec on four threads; report every failing spec, not just the first.
+fn matrix(specs: Vec<String>, case: impl Fn(&str) + Sync) {
+    let queue = Mutex::new(specs.clone());
+    let failures = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                while let Some(spec) = queue.lock().unwrap().pop() {
+                    if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(&spec))) {
+                        let msg = e
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
+                        failures.lock().unwrap().push(format!("{spec}: {}", msg.unwrap_or_default()));
+                    }
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(failures.is_empty(), "{} of {} cases failed:\n{}", failures.len(), specs.len(), failures.join("\n\n"));
+    eprintln!("{} kill/resume cases passed", specs.len());
+}
+
+fn killed(fx: &Fixture, args: &[&str], spec: &str) {
+    let out = fx.run_env(args, &[("ONEMODEL_CRASH_AT", spec)]);
+    assert_eq!(out.status.signal(), Some(9), "{spec} did not kill {args:?}\n{}", text(&out));
+}
+
+/// The brief's proof: SIGKILL at every dedupe crash point for every op, rerun `dedupe`, and the
+/// machine ends exactly where an uninterrupted run leaves it; `undo` then restores the original.
+#[test]
+fn sigkill_at_every_dedupe_point_then_resume_matches_uninterrupted_run() {
+    let Some(reference) = Fixture::new() else { return };
+    let original = disk(&reference);
+    assert_eq!(reference.outcomes(&reference.json(&["dedupe"])), six_replaced());
+    let expected = (disk(&reference), reference.roles(&reference.json(&["scan"])["groups"]));
+    assert_eq!(expected.1, shared_roles());
+
+    matrix(cases(&DEDUPE_POINTS), |spec| {
+        let fx = Fixture::new().unwrap();
+        killed(&fx, &["dedupe"], spec);
+        let resumed = fx.json(&["dedupe"]);
+        assert_eq!(resumed["resumed"], json!(true));
+        assert_eq!(fx.outcomes(&resumed), six_replaced());
+        assert_eq!((disk(&fx), fx.roles(&fx.json(&["scan"])["groups"])), expected);
+        assert!(!disk(&fx).0.iter().any(|l| l.contains(".onemodel-")));
+        assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+        assert_eq!(fx.json(&["dedupe"])["results"], json!([]));
+        let undo = fx.json(&["undo"]);
+        assert_eq!(undo["results"].as_array().unwrap().len(), 6);
+        assert_eq!(disk(&fx), original);
+        assert_eq!(fx.roles(&fx.json(&["scan"])["groups"]), fresh_roles());
+    });
+}
+
+#[test]
+fn sigkill_at_every_undo_point_then_rerun_matches_uninterrupted_undo() {
+    let Some(reference) = Fixture::new() else { return };
+    let original = disk(&reference);
+    reference.json(&["dedupe"]);
+    let undo = reference.json(&["undo"]);
+    assert_eq!(reference.outcomes(&undo).len(), 6);
+    assert!(reference.outcomes(&undo).iter().all(|(_, o)| o == "restored"));
+    assert_eq!(disk(&reference), original);
+
+    matrix(cases(&UNDO_POINTS), |spec| {
+        let fx = Fixture::new().unwrap();
+        fx.json(&["dedupe"]);
+        killed(&fx, &["undo"], spec);
+        let rerun = fx.json(&["undo"]);
+        assert!(fx.outcomes(&rerun).iter().all(|(_, o)| o == "restored"), "{rerun}");
+        assert_eq!(disk(&fx), original);
+        assert_eq!(fx.json(&["undo"])["results"], json!([]));
+        assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+        assert_eq!(fx.roles(&fx.json(&["scan"])["groups"]), fresh_roles());
+    });
+}
+
+#[test]
+fn sigkill_in_hardlink_mode_then_resume_matches_uninterrupted_run() {
+    let Some(reference) = Fixture::new() else { return };
+    assert_eq!(reference.outcomes(&reference.json(&["dedupe", "--hardlink"])), six_replaced());
+    let expected = disk(&reference);
+    let points: Vec<(&str, u32)> = DEDUPE_POINTS.into_iter().filter(|(p, _)| *p != "after-metadata").collect();
+    matrix(cases(&points), |spec| {
+        let fx = Fixture::new().unwrap();
+        killed(&fx, &["dedupe", "--hardlink"], spec);
+        let resumed = fx.json(&["dedupe"]);
+        assert_eq!((resumed["resumed"].clone(), resumed["mode"].clone()), (json!(true), json!("hardlink")));
+        assert_eq!(fx.outcomes(&resumed), six_replaced());
+        assert_eq!(disk(&fx), expected);
+        assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+    });
+}
+
+/// SIGKILL mid-run, then `undo` instead of resuming: the in-flight op is settled, ops that never
+/// started are never executed, finished ops are restored, and a later `dedupe` plans afresh.
+#[test]
+fn sigkill_then_undo_restores_original_state() {
+    matrix(cases(&[("after-staged", 6), ("after-rename", 6)]), |spec| {
+        let fx = Fixture::new().unwrap();
+        let original = disk(&fx);
+        killed(&fx, &["dedupe"], spec);
+        fx.json(&["undo"]);
+        assert_eq!(disk(&fx), original);
+        assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+        let fresh = fx.json(&["dedupe"]);
+        assert_eq!(fresh["resumed"], json!(false));
+        assert_eq!(fx.outcomes(&fresh), six_replaced());
+    });
 }
