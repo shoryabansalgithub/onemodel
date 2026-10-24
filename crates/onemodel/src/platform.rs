@@ -288,13 +288,59 @@ pub struct Holder {
 
 /// Which of `paths` are open or mmapped by any process we can see.
 ///
-/// One `lsof -w -n -P -F pcn -- <paths...>` invocation (fds and memory maps both report as `n`).
-/// lsof exits 1 both for "none of these are open" and for errors, so: exit 0 -> parse; exit 1 with
-/// empty stdout and empty stderr -> nothing open; anything else (missing binary, signal, stderr
-/// output, unparseable field) -> `Err(detail)`, which every caller turns into a refusal. Fail closed.
+/// One `lsof -w -n -P -F pcin -- <paths...>` invocation (fds and memory maps both report). Files
+/// are matched by inode, because lsof prints kernel paths (`/private/var/...`) that need not match
+/// ours. lsof exits 1 whenever any named file is not open, so exit 0 or 1 with empty stderr ->
+/// parse stdout; anything else (missing binary, signal, other exit code, stderr output,
+/// unparseable field) -> `Err(detail)`, which every caller turns into a refusal. Fail closed.
 pub fn open_holders(lsof: &Path, paths: &[&Path]) -> Result<BTreeMap<PathBuf, Vec<Holder>>, String> {
-    let _ = (lsof, paths);
-    todo!()
+    let mut by_ino: BTreeMap<u64, Vec<&Path>> = BTreeMap::new();
+    for p in paths {
+        let meta = fs::symlink_metadata(p).map_err(|e| format!("cannot stat {}: {e}", p.display()))?;
+        by_ino.entry(meta.ino()).or_default().push(p);
+    }
+    let mut found: BTreeMap<PathBuf, Vec<Holder>> = BTreeMap::new();
+    if paths.is_empty() {
+        return Ok(found);
+    }
+    let out = Command::new(lsof)
+        .args(["-w", "-n", "-P", "-F", "pcin", "--"])
+        .args(paths)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", lsof.display()))?;
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(format!("{} failed ({})", lsof.display(), out.status));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if let Some(line) = stderr.lines().find(|l| !l.trim().is_empty()) {
+        return Err(format!("{} reported: {}", lsof.display(), line.trim()));
+    }
+    let (mut pid, mut command, mut ino) = (None, String::new(), None);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let (tag, value) = (line.get(..1).unwrap_or(""), line.get(1..).unwrap_or(""));
+        match tag {
+            "p" => {
+                pid = Some(value.parse::<u32>().map_err(|_| format!("unparseable lsof line {line:?}"))?);
+                command.clear();
+                ino = None;
+            }
+            "c" => command = value.to_string(),
+            "f" => ino = None,
+            "i" => ino = Some(value.parse::<u64>().map_err(|_| format!("unparseable lsof line {line:?}"))?),
+            "n" => {
+                let (Some(pid), Some(ino)) = (pid, ino) else { continue };
+                for p in by_ino.get(&ino).into_iter().flatten() {
+                    let holders = found.entry(p.to_path_buf()).or_default();
+                    if !holders.iter().any(|h| h.pid == pid) {
+                        holders.push(Holder { pid, command: command.clone() });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
 }
 
 /// flock(LOCK_EX | LOCK_NB). `Ok(false)` = someone else holds it.
