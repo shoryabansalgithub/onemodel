@@ -508,8 +508,28 @@ impl Report for DedupeReport {
 }
 
 impl Report for UndoReport {
-    fn human(&self, _env: &Env) -> String {
-        format!("{} ops\n", self.results.len())
+    fn human(&self, env: &Env) -> String {
+        let mut out = String::new();
+        for r in &self.results {
+            let path = env.show(&r.result.target);
+            out.push_str(&match &r.result.outcome {
+                Outcome::Restored => row("restored", &path),
+                Outcome::AlreadyIndependent { note } => {
+                    row("skipped", &format!("{path}  already independent ({note})"))
+                }
+                Outcome::Refused { refusal } => row("refused", &format!("{path}  {refusal}")),
+                Outcome::Replaced => String::new(),
+            });
+        }
+        if self.results.is_empty() {
+            out.push_str("nothing to undo\n");
+        } else {
+            out.push_str(&space_text(env, &self.space));
+        }
+        if self.exit() as u8 != Exit::Ok as u8 {
+            out.push_str("some files are still shared; run `onemodel undo` again once the reason is gone\n");
+        }
+        out
     }
     fn exit(&self) -> Exit {
         let unsettled = self.results.iter().any(|r| matches!(r.result.outcome, Outcome::Refused { .. }));
@@ -518,8 +538,49 @@ impl Report for UndoReport {
 }
 
 impl Report for VerifyReport {
-    fn human(&self, _env: &Env) -> String {
-        format!("{} problems\n", self.problems.len())
+    fn human(&self, env: &Env) -> String {
+        let mut out = String::new();
+        for p in &self.problems {
+            let (what, path) = match p {
+                Problem::ContentChanged { path } => ("content changed".to_string(), path),
+                Problem::Missing { path } => ("missing".to_string(), path),
+                Problem::Unreadable { path, error } => (format!("unreadable ({error})"), path),
+                Problem::Interrupted { run } => {
+                    out.push_str(&row(
+                        "problem",
+                        &format!("run {run} was interrupted; run `onemodel dedupe` or `onemodel undo`"),
+                    ));
+                    continue;
+                }
+                Problem::ClaimMissing { store, path } => (format!("{store} file missing"), path),
+                Problem::ClaimSizeMismatch { store, path, expected, actual } => {
+                    (format!("{store} file is {actual} bytes, its manifest says {expected}"), path)
+                }
+                Problem::ClaimDigestMismatch { store, path } => {
+                    (format!("{store} file does not match its digest"), path)
+                }
+                Problem::LinkBroken { store, link } => (format!("{store} link is broken"), link),
+                Problem::ClaimsUnreadable { store, root, error } => {
+                    (format!("{store} metadata unreadable ({error})"), root)
+                }
+            };
+            out.push_str(&row("problem", &format!("{what}  {}", env.show(path))));
+        }
+        for path in &self.released {
+            out.push_str(&row("released", &format!("{}  replaced by an app since dedupe", env.show(path))));
+        }
+        let summary = format!(
+            "{} ({}) hashed, {} checked in {}",
+            plural(self.checked_files, "managed file"),
+            fmt_bytes(self.checked_bytes),
+            plural(self.claims, "store claim"),
+            plural(self.stores, "store")
+        );
+        out.push_str(&match self.problems.len() {
+            0 => format!("ok: {summary}\n"),
+            n => format!("{}: {summary}\n", plural(n as u64, "problem")),
+        });
+        out
     }
     fn exit(&self) -> Exit {
         if self.problems.is_empty() { Exit::Ok } else { Exit::Problems }
