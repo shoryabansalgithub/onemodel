@@ -1,0 +1,20 @@
+# Workspace root. One member: the split would only earn its place if a second consumer
+# of the library half appeared (a GUI, a daemon). Until then a lib/bin split is ceremony.
+[workspace]
+resolver = "3"
+members = ["crates/onemodel"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# unsafe is confined to platform.rs; everything else must stay safe.
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
