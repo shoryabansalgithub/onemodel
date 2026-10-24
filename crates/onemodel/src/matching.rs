@@ -13,6 +13,7 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -197,17 +198,33 @@ fn refine(
     buckets.into_values().filter(|b| b.len() >= 2).collect()
 }
 
+/// `f` over every item on up to four workers, results in input order. Workers pull the next index
+/// as they finish, because inputs arrive sorted by size and fixed chunks would give one worker
+/// every large file.
 fn parallel_map<T: Sync + Send, R: Send>(items: Vec<T>, f: impl Fn(&T) -> R + Sync) -> Vec<(T, R)> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
-    let chunk = items.len().div_ceil(workers);
-    let results: Vec<R> = std::thread::scope(|s| {
-        let handles: Vec<_> = items.chunks(chunk).map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>())).collect();
-        handles.into_iter().flat_map(|h| h.join().expect("hash worker panicked")).collect()
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4).min(items.len());
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let ix = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(ix) else { break done };
+                        done.push((ix, f(item)));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            for (ix, r) in h.join().expect("hash worker panicked") {
+                results[ix] = Some(r);
+            }
+        }
     });
-    items.into_iter().zip(results).collect()
+    items.into_iter().zip(results).map(|(t, r)| (t, r.expect("every index was taken by a worker"))).collect()
 }
 
 fn sampled_hash(path: &Path, size: u64) -> io::Result<Hash> {
@@ -232,17 +249,26 @@ fn sampled_hash(path: &Path, size: u64) -> io::Result<Hash> {
     Ok(Hash(*hasher.finalize().as_bytes()))
 }
 
-/// Full BLAKE3 of one file, read loop with an 8 MiB buffer.
+/// Full BLAKE3 of one file.
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
-    let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
+    read_chunks(path, |chunk| {
+        hasher.update(chunk);
+    })?;
+    Ok(Hash(*hasher.finalize().as_bytes()))
+}
+
+/// Feed every byte of `path` to `f` in order, through one 8 MiB buffer (no mmap: a file truncated
+/// under a mapping is SIGBUS).
+pub fn read_chunks(path: &Path, mut f: impl FnMut(&[u8])) -> io::Result<()> {
+    let mut file = File::open(path)?;
     let mut buf = vec![0u8; BUF];
     loop {
         let n = read_full(&mut file, &mut buf)?;
         if n == 0 {
-            return Ok(Hash(*hasher.finalize().as_bytes()));
+            return Ok(());
         }
-        hasher.update(&buf[..n]);
+        f(&buf[..n]);
     }
 }
 
