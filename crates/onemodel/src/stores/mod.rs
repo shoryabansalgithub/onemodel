@@ -1,9 +1,10 @@
 //! The store registry: everything onemodel knows about where apps keep models.
 //!
-//! A store kind answers three questions and nothing else: where are your roots, what is this file
-//! (candidate / in-progress download / not yours), and are you intact. The walk, the size filter,
-//! symlink handling, overlap between roots and the "downloading" verdict are shared and live here,
-//! so a new kind cannot get them wrong.
+//! A store kind answers its own questions and nothing else: where are your roots, what is this
+//! file (candidate / in-progress download / not yours), and what must stay true for the app to
+//! keep working (its [`Claim`]s). The walk, the size filter, symlink handling, overlap between
+//! roots, the "downloading" verdict and checking claims are shared, so a new kind cannot get them
+//! wrong. Store kinds never hash, stat for policy, or write.
 //!
 //! Adding Jan, GPT4All or ComfyUI is one file implementing [`StoreKind`] plus one line in
 //! [`REGISTRY`]. Example (the whole module):
@@ -53,12 +54,29 @@ pub trait StoreKind: Sync {
     /// Never called for symlinks, directories, or onemodel's own temp files.
     fn classify(&self, rel: &Path) -> Entry;
 
-    /// Store-specific structural integrity, run by `verify`. `deep` permits re-hashing content.
-    /// Default: no structure beyond the files themselves.
-    fn check_intact(&self, root: &Path, deep: bool) -> Vec<IntactProblem> {
-        let _ = (root, deep);
-        Vec::new()
+    /// What must hold for the app to find its models, read from the app's own metadata (manifests,
+    /// snapshot symlinks). `verify` checks these centrally. Most stores claim nothing.
+    fn claims(&self, root: &Path) -> io::Result<Vec<Claim>> {
+        let _ = root;
+        Ok(Vec::new())
     }
+}
+
+/// An integrity assertion a store makes about its own files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// `path` must be a regular file of this size. Its sha256 is checked for files onemodel manages,
+    /// and for every claimed file with `verify --deep`.
+    Regular { path: PathBuf, size: u64, sha256: [u8; 32] },
+    /// `link` must be a symlink whose chain ends at an existing regular file.
+    LinkResolves { link: PathBuf },
+}
+
+/// The default for stores without their own naming rules: a known partial-download suffix means
+/// the app is downloading; any other file is a candidate.
+pub fn generic_classify(rel: &Path) -> Entry {
+    let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if PARTIAL_SUFFIXES.iter().any(|s| name.ends_with(s)) { Entry::InProgress } else { Entry::Candidate }
 }
 
 /// The verdict on one regular file in a store.
@@ -107,12 +125,6 @@ pub struct FoundFile {
 pub struct Inventory {
     pub stores: Vec<Store>,
     pub files: Vec<FoundFile>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IntactProblem {
-    pub path: PathBuf,
-    pub detail: String,
 }
 
 /// Find every store root on this machine and every candidate file in it.
@@ -203,12 +215,6 @@ fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, PathBuf, Metadata)> + '_ 
 /// unknown (LM Studio) or shared (HF `.incomplete`, llama.cpp `.downloadInProgress`).
 pub const PARTIAL_SUFFIXES: &[&str] =
     &[".part", ".partial", ".download", ".incomplete", ".tmp", ".downloadInProgress", ".crdownload"];
-
-/// Classification for stores with no layout of their own: partial suffix -> InProgress, else Candidate.
-pub fn generic_classify(rel: &Path) -> Entry {
-    let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if PARTIAL_SUFFIXES.iter().any(|s| name.ends_with(s)) { Entry::InProgress } else { Entry::Candidate }
-}
 
 /// Prefix of onemodel's own temp files (see `replace::temp_path`). Ignored by every walk.
 pub const TEMP_PREFIX: &str = ".onemodel-";

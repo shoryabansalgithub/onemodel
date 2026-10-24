@@ -5,9 +5,10 @@
 //! the end of a chain is a candidate; replacing it by rename keeps every symlink valid because
 //! symlinks name paths, not inodes.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Entry, IntactProblem, StoreKind};
+use super::{Claim, Entry, StoreKind};
 use crate::Env;
 
 pub struct HuggingFace;
@@ -31,10 +32,8 @@ impl StoreKind for HuggingFace {
         hub_classify(rel)
     }
 
-    /// Every symlink under `*/snapshots/**` resolves (following the full chain) to an existing
-    /// regular file. `deep`: blobs whose name is 64 hex equal the sha256 of their content.
-    fn check_intact(&self, root: &Path, deep: bool) -> Vec<IntactProblem> {
-        todo!("{root:?} {deep}")
+    fn claims(&self, root: &Path) -> io::Result<Vec<Claim>> {
+        snapshot_links(root)
     }
 }
 
@@ -55,4 +54,26 @@ pub fn hub_classify(rel: &Path) -> Entry {
         ["blobs", shard, _] if shard.len() == 2 && shard.bytes().all(|b| b.is_ascii_hexdigit()) => Entry::Candidate,
         _ => Entry::Ignore,
     }
+}
+
+/// Every symlink under `models--*/snapshots/` must resolve to a regular file.
+pub fn snapshot_links(root: &Path) -> io::Result<Vec<Claim>> {
+    let mut out = Vec::new();
+    for repo in std::fs::read_dir(root)? {
+        let repo = repo?;
+        if !repo.file_name().to_string_lossy().starts_with("models--") || !repo.file_type()?.is_dir() {
+            continue;
+        }
+        let snapshots = repo.path().join("snapshots");
+        if !snapshots.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&snapshots).follow_links(false).sort_by_file_name() {
+            let entry = entry.map_err(io::Error::other)?;
+            if entry.path_is_symlink() {
+                out.push(Claim::LinkResolves { link: entry.into_path() });
+            }
+        }
+    }
+    Ok(out)
 }

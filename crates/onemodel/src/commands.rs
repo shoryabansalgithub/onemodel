@@ -9,7 +9,7 @@ use crate::journal::{CrashPoint, Journal, RunId, crash_point};
 use crate::matching::Unreadable;
 use crate::plan::{GroupPlan, Mode, Plan, Refusal};
 use crate::replace::Outcome;
-use crate::stores::{IntactProblem, Store};
+use crate::stores::Store;
 use crate::{Env, Exit, Report};
 
 // ---------------------------------------------------------------------------------------------
@@ -139,10 +139,6 @@ pub enum Problem {
     },
     Missing {
         path: PathBuf,
-    },
-    Store {
-        store: String,
-        problem: IntactProblem,
     },
     /// A dedupe was interrupted; run `onemodel dedupe` to finish it or `onemodel undo`.
     Interrupted {

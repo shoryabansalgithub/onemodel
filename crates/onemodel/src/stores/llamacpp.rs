@@ -3,10 +3,11 @@
 //! wrote flat `*.gguf` files with `.json` etag sidecars. Downloads in flight end in
 //! `.downloadInProgress`.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
-use super::huggingface::hub_classify;
-use super::{Entry, StoreKind};
+use super::huggingface::{hub_classify, snapshot_links};
+use super::{Claim, Entry, StoreKind};
 use crate::Env;
 
 pub struct LlamaCpp;
@@ -36,5 +37,9 @@ impl StoreKind for LlamaCpp {
             Entry::Ignore if rel.components().count() == 1 && name.ends_with(".gguf") => Entry::Candidate,
             entry => entry,
         }
+    }
+
+    fn claims(&self, root: &Path) -> io::Result<Vec<Claim>> {
+        snapshot_links(root)
     }
 }

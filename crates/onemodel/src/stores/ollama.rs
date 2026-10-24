@@ -1,11 +1,15 @@
 //! Ollama: `$OLLAMA_MODELS` or `~/.ollama/models`.
 //!
 //! `blobs/sha256-<64hex>` is content-addressed; `manifests/<registry>/<ns>/<model>/<tag>` is JSON
-//! listing `layers[].digest` and `size`. Pulls write `blobs/sha256-<hex>-partial[-N]`.
+//! listing `config` and `layers[]`, each with a `digest` and `size`. Pulls write
+//! `blobs/sha256-<hex>-partial[-N]`.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Entry, IntactProblem, StoreKind};
+use serde::Deserialize;
+
+use super::{Claim, Entry, StoreKind};
 use crate::Env;
 use crate::matching::parse_hex32;
 
@@ -38,9 +42,50 @@ impl StoreKind for Ollama {
         }
     }
 
-    /// Every layer of every manifest has a blob `blobs/sha256-<hex>` that is a regular file of the
-    /// manifest's `size`. `deep`: its sha256 equals the digest. Unparseable manifest = problem.
-    fn check_intact(&self, root: &Path, deep: bool) -> Vec<IntactProblem> {
-        todo!("{root:?} {deep}")
+    /// Every digest a manifest names must be a blob of that size and sha256.
+    fn claims(&self, root: &Path) -> io::Result<Vec<Claim>> {
+        let manifests = root.join("manifests");
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(&manifests).follow_links(false).sort_by_file_name() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) if e.path() == Some(manifests.as_path()) && e.io_error().is_some_and(is_not_found) => break,
+                Err(e) => return Err(io::Error::other(e)),
+            };
+            if !entry.file_type().is_file() || entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path())?;
+            let manifest: Manifest = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", entry.path().display())))?;
+            for layer in manifest.config.into_iter().chain(manifest.layers) {
+                let sha256 = layer.digest.strip_prefix("sha256:").and_then(parse_hex32).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: digest {:?} is not sha256:<64 hex>", entry.path().display(), layer.digest),
+                    )
+                })?;
+                let path = root.join("blobs").join(format!("sha256-{}", &layer.digest["sha256:".len()..]));
+                out.push(Claim::Regular { path, size: layer.size, sha256 });
+            }
+        }
+        Ok(out)
     }
+}
+
+fn is_not_found(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    config: Option<Layer>,
+    #[serde(default)]
+    layers: Vec<Layer>,
+}
+
+#[derive(Deserialize)]
+struct Layer {
+    digest: String,
+    size: u64,
 }
