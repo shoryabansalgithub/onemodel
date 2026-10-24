@@ -11,8 +11,9 @@
 //! So when any record is observable after a crash, every earlier record is too.
 //!
 //! Read discipline: `replay` parses every line. A final line without its newline is a torn append
-//! (the write never completed, so the action it guarded never started) and is dropped. Any other
-//! unparseable line, or an illegal state transition, is a hard error: we never guess about disk state.
+//! (the write never completed, so the action it guarded never started) and is dropped; `reopen`
+//! truncates it away before appending. Any other unparseable line, or an illegal state transition,
+//! is a hard error: we never guess about disk state.
 //!
 //! Undo appends to the run file of the op it reverses, so an op's whole life is in one place.
 
@@ -142,6 +143,8 @@ pub struct RunLog {
     pub ops: Vec<OpState>,
     pub ended: bool,
     pub file: PathBuf,
+    /// Bytes of complete lines; anything after is a torn append.
+    valid_len: u64,
 }
 
 /// A file that is currently a clone (or hardlink) made by onemodel: op Done, not Undone.
@@ -194,10 +197,23 @@ impl Journal {
         self.dir.join("runs")
     }
 
-    /// Every run, oldest first, replayed into op states.
+    /// Every run, oldest first, replayed into op states. Leftover `.tmp` files are runs whose Plan
+    /// never became durable, so nothing on disk changed for them: they are removed.
     pub fn runs(&self) -> anyhow::Result<Vec<RunLog>> {
-        let _ = &self.dir;
-        todo!()
+        let mut runs = Vec::new();
+        for entry in fs::read_dir(self.runs_dir())? {
+            let path = entry?.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("jsonl") => {
+                    let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+                    runs.push(replay(path.clone(), &bytes).with_context(|| format!("journal {}", path.display()))?);
+                }
+                Some("tmp") => fs::remove_file(&path)?,
+                _ => {}
+            }
+        }
+        runs.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(runs)
     }
 
     /// Create `runs/<id>.jsonl` with O_EXCL, append the Plan record, fsync file and `runs/`.
@@ -227,9 +243,62 @@ impl RunWriter {
 }
 
 /// Fold one run file's records into op states. Illegal transitions are errors.
-pub fn replay(lines: &[u8]) -> anyhow::Result<(RunId, Plan, Vec<OpState>, bool)> {
-    let _ = lines;
-    todo!()
+pub fn replay(file: PathBuf, bytes: &[u8]) -> anyhow::Result<RunLog> {
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let mut lines = bytes[..complete].split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate();
+    let Some((_, first)) = lines.next() else { bail!("empty run file") };
+    let Record::Plan { v, run, plan } = serde_json::from_slice(first).context("line 1")? else {
+        bail!("line 1 is not a plan record");
+    };
+    if v != FORMAT_VERSION {
+        bail!("journal format {v} is not supported by this onemodel (format {FORMAT_VERSION})");
+    }
+    let mut ops = vec![OpState::Pending; plan.op_count() as usize];
+    let mut ended = false;
+    for (i, line) in lines {
+        let rec: Record = serde_json::from_slice(line).with_context(|| format!("line {}", i + 1))?;
+        let op_ix = match &rec {
+            Record::Plan { .. } => bail!("line {}: second plan record", i + 1),
+            Record::End { .. } => {
+                if ended {
+                    bail!("line {}: second end record", i + 1);
+                }
+                ended = true;
+                continue;
+            }
+            Record::Staged { op, .. }
+            | Record::Done { op }
+            | Record::Refused { op, .. }
+            | Record::UndoStaged { op, .. }
+            | Record::Undone { op, .. }
+            | Record::UndoRefused { op, .. } => *op as usize,
+        };
+        let Some(state) = ops.get_mut(op_ix) else { bail!("line {}: op {op_ix} is not in the plan", i + 1) };
+        let undo_record = matches!(rec, Record::UndoStaged { .. } | Record::Undone { .. } | Record::UndoRefused { .. });
+        if undo_record != ended {
+            bail!(
+                "line {}: {} record {} the end record",
+                i + 1,
+                if undo_record { "undo" } else { "dedupe" },
+                if ended { "after" } else { "before" }
+            );
+        }
+        *state = match (&*state, rec) {
+            (OpState::Pending | OpState::Staged { .. }, Record::Staged { ino, .. }) => OpState::Staged { ino },
+            (OpState::Staged { ino }, Record::Done { .. }) => OpState::Done { ino: *ino },
+            (OpState::Pending | OpState::Staged { .. }, Record::Refused { refusal, .. }) => OpState::Refused(refusal),
+            (
+                OpState::Done { ino: done_ino } | OpState::UndoStaged { done_ino, .. },
+                Record::UndoStaged { ino, .. },
+            ) => OpState::UndoStaged { done_ino: *done_ino, ino },
+            (OpState::Done { .. } | OpState::UndoStaged { .. }, Record::Undone { .. }) => OpState::Undone,
+            (OpState::Done { ino } | OpState::UndoStaged { done_ino: ino, .. }, Record::UndoRefused { .. }) => {
+                OpState::Done { ino: *ino }
+            }
+            (from, rec) => bail!("line {}: {rec:?} is not a valid step from {from:?}", i + 1),
+        };
+    }
+    Ok(RunLog { id: run, plan, ops, ended, file, valid_len: complete as u64 })
 }
 
 /// Every file onemodel currently manages, across all runs.
