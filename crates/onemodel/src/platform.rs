@@ -243,6 +243,43 @@ pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// True if the file itself (not a symlink target) carries an extended ACL. clonefile would give the
+/// temp the keeper's ACL, and onemodel does not copy ACLs, so such members are refused.
+pub fn has_acl(path: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{c_char, c_int, c_void};
+        const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+        const ACL_FIRST_ENTRY: c_int = 0;
+        unsafe extern "C" {
+            fn acl_get_link_np(path: *const c_char, ty: c_int) -> *mut c_void;
+            fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+            fn acl_free(obj: *mut c_void) -> c_int;
+        }
+        let c = c_path(path)?;
+        // SAFETY: `c` is NUL-terminated and outlives the call.
+        let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ENOENT) && fs::symlink_metadata(path).is_ok() {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is a live ACL returned above; `entry` is a valid out-pointer.
+        let has_entry = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+        // SAFETY: `acl` came from acl_get_link_np and is freed exactly once.
+        unsafe { acl_free(acl) };
+        Ok(has_entry)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::symlink_metadata(path).map(|_| false)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holder {
     pub pid: u32,
