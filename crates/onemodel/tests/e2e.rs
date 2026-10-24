@@ -655,3 +655,178 @@ fn undo_rejects_an_unknown_run() {
     let run = fx.json(&["scan"])["runs"][0]["id"].as_str().unwrap().to_string();
     assert_eq!(fx.outcomes(&fx.json(&["undo", "--run", &run])).len(), 6);
 }
+
+#[test]
+fn refuses_store_mid_download() {
+    let sa = &digests()[0];
+    let cases: [(&str, String, &[&str]); 4] = [
+        ("ollama", format!(".ollama/models/blobs/sha256-{sa}-partial-0"), &[OLLAMA_A, OLLAMA_B]),
+        ("huggingface", "hf/hub/models--org--z/blobs/abc.incomplete".to_string(), &[HF_A, HF_C]),
+        ("llama.cpp", "Library/Caches/llama.cpp/x.gguf.downloadInProgress".to_string(), &[LLAMA_A, LLAMA_B]),
+        ("lmstudio", ".lmstudio/models/pub/repo/new.gguf.part".to_string(), &[LM_A, LM_C]),
+    ];
+    for (store, marker, frozen) in cases {
+        let Some(fx) = Fixture::new() else { return };
+        put(&fx.home.join(&marker), b"partial", 0o644, 1_700_000_050, None);
+        put(&fx.home.join("extra/x.gguf.crdownload"), b"partial", 0o644, 1_700_000_051, None);
+        let before = disk(&fx);
+        let report = fx.json(&["dedupe"]);
+        let refused: Vec<String> = fx
+            .roles(&report["plan"]["groups"])
+            .into_iter()
+            .filter(|(_, r)| r == "refused:store_downloading")
+            .map(|(p, _)| p)
+            .collect();
+        let mut expected: Vec<String> = frozen.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(refused, expected, "{store}");
+        let m = member(&fx, &report["plan"]["groups"], frozen[0]);
+        assert_eq!(m["refusal"]["store"], json!(store));
+        assert_eq!(m["refusal"]["marker"], json!(fx.home.join(&marker)));
+        assert!(fx.outcomes(&report).iter().all(|(p, o)| o == "replaced" && !frozen.contains(&p.as_str())));
+        assert!(
+            fx.outcomes(&report).iter().any(|(p, _)| p == EXTRA_B),
+            "{store}: a .crdownload in --path must not freeze it"
+        );
+        let after = disk(&fx);
+        for rel in frozen {
+            let line = |d: &Disk| d.0.iter().find(|l| l.starts_with(&format!("file {rel} "))).cloned();
+            assert_eq!(line(&after), line(&before));
+        }
+    }
+}
+
+/// A linked name may live outside every store, so replacing one name would split the file.
+/// A multiply linked file can still be the keeper, and is preferred as one.
+#[test]
+fn refuses_multiply_linked_target() {
+    let Some(fx) = Fixture::new() else { return };
+    fs::hard_link(fx.path(LLAMA_B), fx.root.join("outside-1")).unwrap();
+    fs::hard_link(fx.path(EXTRA_B), fx.root.join("outside-2")).unwrap();
+    let report = fx.json(&["dedupe"]);
+    let groups = &report["plan"]["groups"];
+    assert_eq!(member(&fx, groups, LLAMA_B)["role"], json!("keeper"));
+    assert_eq!(member(&fx, groups, EXTRA_B)["refusal"], json!({"reason": "multiply_linked", "nlink": 2}));
+    assert_eq!(fx.outcomes(&report).iter().filter(|(p, _)| p == OLLAMA_B).count(), 1);
+    assert_eq!(fs::metadata(fx.path(EXTRA_B)).unwrap().nlink(), 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn refuses_files_with_an_acl() {
+    let Some(fx) = Fixture::new() else { return };
+    let out = Command::new("/bin/chmod").args(["+a", "everyone allow read"]).arg(fx.path(LLAMA_B)).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let report = fx.json(&["dedupe"]);
+    assert_eq!(member(&fx, &report["plan"]["groups"], LLAMA_B)["refusal"], json!({"reason": "has_acl"}));
+    assert_eq!(report["results"].as_array().unwrap().len(), 5);
+}
+
+/// An attached disk image, detached on drop.
+#[cfg(target_os = "macos")]
+struct Volume {
+    mount: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Volume {
+    fn attach(fx: &Fixture, fs_type: &str, mib: u32) -> Volume {
+        let image = fx.root.join(format!("{}.dmg", fs_type.replace('+', "plus")));
+        let mount = fx.root.join(format!("vol-{}", fs_type.replace('+', "plus")));
+        let out = Command::new("/usr/bin/hdiutil")
+            .args(["create", "-quiet", "-size", &format!("{mib}m"), "-fs", fs_type, "-volname", "onemodel-test"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        fs::create_dir_all(&mount).unwrap();
+        let out = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        Volume { mount }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/hdiutil").args(["detach", "-quiet", "-force"]).arg(&self.mount).output();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn refuses_across_volumes_and_without_clone_support() {
+    let Some(mut fx) = Fixture::new() else { return };
+    let vol = Volume::attach(&fx, "HFS+", 40);
+    fx.extra_args = vec!["--path".into(), vol.mount.display().to_string()];
+    put(&vol.mount.join("a.gguf"), &content("A"), 0o644, 1_700_000_061, None);
+    put(&vol.mount.join("x1.gguf"), &content("X"), 0o644, 1_700_000_062, None);
+    put(&vol.mount.join("x2.gguf"), &content("X"), 0o644, 1_700_000_063, None);
+    let report = fx.json(&["dedupe"]);
+    let groups = &report["plan"]["groups"];
+    let a = member(&fx, groups, &vol.mount.join("a.gguf").display().to_string());
+    assert_eq!(a["refusal"]["reason"], json!("different_volume"));
+    assert_eq!(member(&fx, groups, &vol.mount.join("x1.gguf").display().to_string())["role"], json!("keeper"));
+    assert_eq!(
+        member(&fx, groups, &vol.mount.join("x2.gguf").display().to_string())["refusal"],
+        json!({"reason": "no_clone_support", "fs_type": "hfs"})
+    );
+    assert_eq!(fx.outcomes(&report), six_replaced());
+}
+
+#[test]
+fn refuses_target_changed_after_plan() {
+    let Some(fx) = Fixture::new() else { return };
+    let out = fx.run_env(&["dedupe"], &[("ONEMODEL_CRASH_AT", "after-plan:1")]);
+    assert_eq!(out.status.signal(), Some(9), "{}", text(&out));
+    fs::set_permissions(fx.path(EXTRA_B), fs::Permissions::from_mode(0o600)).unwrap();
+    let report = fx.json(&["dedupe"]);
+    assert_eq!(report["resumed"], json!(true));
+    let expected: Vec<(String, String)> = six_replaced()
+        .into_iter()
+        .map(|(p, o)| if p == EXTRA_B { (p, "refused:changed_since_scan".to_string()) } else { (p, o) })
+        .collect();
+    assert_eq!(fx.outcomes(&report), expected);
+    assert_eq!(fs::metadata(fx.path(EXTRA_B)).unwrap().mode() & 0o777, 0o600);
+}
+
+/// Hashes said equal at plan time; the keeper was then rewritten in place. The byte compare of the
+/// prepared clone against each target catches it, so no target gets the new bytes.
+#[test]
+fn refuses_when_bytes_differ_despite_plan() {
+    let Some(fx) = Fixture::new() else { return };
+    let out = fx.run_env(&["dedupe"], &[("ONEMODEL_CRASH_AT", "after-plan:1")]);
+    assert_eq!(out.status.signal(), Some(9), "{}", text(&out));
+    let mut keeper = OpenOptions::new().write(true).open(fx.path(OLLAMA_B)).unwrap();
+    keeper.seek(SeekFrom::Start(3_000_000)).unwrap();
+    keeper.write_all(b"changed").unwrap();
+    drop(keeper);
+    let report = fx.json(&["dedupe"]);
+    let mismatches: Vec<&Value> =
+        report["results"].as_array().unwrap().iter().filter(|r| r["outcome"] == json!("refused")).collect();
+    assert_eq!(mismatches.len(), 2);
+    for r in mismatches {
+        assert_eq!(r["refusal"], json!({"reason": "content_mismatch", "offset": 3_000_000}));
+    }
+    assert_eq!(fs::read(fx.path(LLAMA_B)).unwrap(), content("B"));
+    assert_eq!(fs::read(fx.path(EXTRA_B)).unwrap(), content("B"));
+}
+
+#[test]
+fn second_instance_is_rejected() {
+    use std::os::fd::AsRawFd;
+    let Some(fx) = Fixture::new() else { return };
+    fs::create_dir_all(&fx.state).unwrap();
+    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(fx.state.join("lock")).unwrap();
+    // SAFETY: the descriptor is open for the duration of the call.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let out = fx.run(&["dedupe"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("another onemodel"), "{}", text(&out));
+    assert_eq!(fx.run_files(), Vec::<String>::new());
+}
