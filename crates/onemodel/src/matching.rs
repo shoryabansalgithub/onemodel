@@ -1,8 +1,8 @@
 //! Identity, twice: which inode a path is (`FileId`, `Fingerprint`), and which bytes it holds (`Hash`).
 //!
 //! The public surface is one pipeline function plus two primitives. The stages (size bucket ->
-//! partial hash -> full BLAKE3) are private: no caller needs to know they exist, and changing the
-//! partial-hash window cannot leak anywhere.
+//! sampled hash -> full BLAKE3) are private: no caller needs to know they exist, and changing the
+//! sampling window cannot leak anywhere.
 //!
 //! Hash equality only *proposes* a duplicate. Nothing in this module decides a replacement; the
 //! byte-for-byte compare that authorizes one happens in `replace`, against the clone itself.
@@ -138,16 +138,98 @@ const BUF: usize = 8 << 20;
 /// The matching pipeline.
 ///
 /// 1. collapse paths by `FileId`; bucket inodes by size; drop buckets with one inode.
-/// 2. partial hash = BLAKE3(size_le || first 1 MiB || last 1 MiB); drop singleton sub-buckets.
+/// 2. sampled hash = BLAKE3(size_le || head || middle || tail), 1 MiB each (the whole file when it
+///    is at most 3 MiB). GGUF headers are shared across quantizations, so head alone is weak.
+///    Drop singleton sub-buckets.
 /// 3. full BLAKE3 with a read loop (no mmap: a file truncated under a mapping is SIGBUS), files
 ///    hashed in parallel on `std::thread::scope` workers (min(available_parallelism, 4)).
 /// 4. group by full hash; drop singletons.
 ///
-/// Cost model: every file in a surviving size bucket is read fully once. No hash cache in v1:
+/// Cost model: every file in a surviving sampled bucket is read fully once. No hash cache in v1:
 /// a cache keyed on fingerprint is a second source of truth for content and the first thing to lie.
 pub fn find_duplicates(files: Vec<FoundFile>) -> Matches {
-    let _ = files;
-    todo!()
+    let mut by_id: BTreeMap<FileId, Inode> = BTreeMap::new();
+    for f in files {
+        by_id
+            .entry(f.stat.id)
+            .or_insert_with(|| Inode { stat: f.stat, paths: Vec::new() })
+            .paths
+            .push((f.path, f.store));
+    }
+    let mut by_size: BTreeMap<u64, Vec<Inode>> = BTreeMap::new();
+    for mut inode in by_id.into_values() {
+        inode.paths.sort();
+        by_size.entry(inode.stat.size).or_default().push(inode);
+    }
+    let sized: Vec<Inode> = by_size.into_values().filter(|b| b.len() >= 2).flatten().collect();
+
+    let mut unreadable = Vec::new();
+    let sampled = refine(sized, |i| sampled_hash(&i.paths[0].0, i.stat.size), &mut unreadable);
+    let full =
+        refine(sampled.into_iter().flatten().map(|(i, _)| i).collect(), |i| hash_file(&i.paths[0].0), &mut unreadable);
+
+    let mut groups: Vec<DupGroup> = full
+        .into_iter()
+        .map(|mut inodes| {
+            inodes.sort_by(|a, b| a.0.paths[0].0.cmp(&b.0.paths[0].0));
+            let (hash, size) = (inodes[0].1, inodes[0].0.stat.size);
+            DupGroup { hash, size, inodes: inodes.into_iter().map(|(i, _)| i).collect() }
+        })
+        .collect();
+    groups.sort_by_key(|g| (Reverse(g.size), g.hash));
+    Matches { groups, unreadable }
+}
+
+/// Hash every inode with `key`, then split into buckets of equal (size, key) with at least two
+/// members. Read failures go to `unreadable` and drop the inode.
+fn refine(
+    inodes: Vec<Inode>,
+    key: impl Fn(&Inode) -> io::Result<Hash> + Sync,
+    unreadable: &mut Vec<Unreadable>,
+) -> Vec<Vec<(Inode, Hash)>> {
+    let mut buckets: BTreeMap<(u64, Hash), Vec<(Inode, Hash)>> = BTreeMap::new();
+    for (inode, result) in parallel_map(inodes, key) {
+        match result {
+            Ok(h) => buckets.entry((inode.stat.size, h)).or_default().push((inode, h)),
+            Err(e) => unreadable.push(Unreadable { path: inode.paths[0].0.clone(), error: e.to_string() }),
+        }
+    }
+    buckets.into_values().filter(|b| b.len() >= 2).collect()
+}
+
+fn parallel_map<T: Sync + Send, R: Send>(items: Vec<T>, f: impl Fn(&T) -> R + Sync) -> Vec<(T, R)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+    let chunk = items.len().div_ceil(workers);
+    let results: Vec<R> = std::thread::scope(|s| {
+        let handles: Vec<_> = items.chunks(chunk).map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().expect("hash worker panicked")).collect()
+    });
+    items.into_iter().zip(results).collect()
+}
+
+fn sampled_hash(path: &Path, size: u64) -> io::Result<Hash> {
+    let file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&size.to_le_bytes());
+    let windows = if size <= 3 * SAMPLE {
+        vec![(0, size)]
+    } else {
+        vec![(0, SAMPLE), (size / 2 - SAMPLE / 2, SAMPLE), (size - SAMPLE, SAMPLE)]
+    };
+    let mut buf = vec![0u8; SAMPLE.min(size) as usize];
+    for (offset, len) in windows {
+        let mut done = 0u64;
+        while done < len {
+            let n = (len - done).min(buf.len() as u64) as usize;
+            file.read_exact_at(&mut buf[..n], offset + done)?;
+            hasher.update(&buf[..n]);
+            done += n as u64;
+        }
+    }
+    Ok(Hash(*hasher.finalize().as_bytes()))
 }
 
 /// Full BLAKE3 of one file, read loop with an 8 MiB buffer.
