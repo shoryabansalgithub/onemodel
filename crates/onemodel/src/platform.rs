@@ -75,25 +75,89 @@ pub fn clone_file(src: &Path, dst: &Path) -> Result<(), CloneError> {
 /// Facts about the volume holding `path`.
 pub struct VolumeInfo {
     pub dev: u64,
-    /// Found portably by walking parents until `st_dev` changes.
+    /// macOS: statfs `f_mntonname`. Linux: found by walking parents until `st_dev` changes.
     pub mount: PathBuf,
     /// macOS: statfs `f_fstypename` ("apfs", "hfs"). Linux: name for the statfs `f_type` magic.
     pub fs_type: String,
-    /// apfs; btrfs (0x9123683e); xfs (0x58465342, reflink may still be off: the clone call decides).
+    /// apfs; btrfs; xfs (reflink may still be off: the clone call decides).
     pub clones: bool,
-    /// statvfs `f_bavail * f_frsize`: what an unprivileged writer can actually use.
+    /// What an unprivileged writer can actually use.
     pub free: u64,
 }
 
 pub fn volume(path: &Path) -> io::Result<VolumeInfo> {
-    let _ = path;
-    todo!()
+    let dev = fs::symlink_metadata(path)?.dev();
+    #[cfg(target_os = "macos")]
+    {
+        let st = statfs(path)?;
+        // SAFETY: the kernel NUL-terminates both fixed-size name arrays.
+        let (fs_type, mount) = unsafe {
+            (
+                std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()).to_string_lossy().into_owned(),
+                PathBuf::from(std::ffi::OsStr::from_bytes(
+                    std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()).to_bytes(),
+                )),
+            )
+        };
+        let clones = fs_type == "apfs";
+        Ok(VolumeInfo { dev, mount, fs_type, clones, free: st.f_bavail * u64::from(st.f_bsize) })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let st = statfs(path)?;
+        let (fs_type, clones) = match st.f_type as u64 & 0xffff_ffff {
+            0x9123_683e => ("btrfs".to_string(), true),
+            0x5846_5342 => ("xfs".to_string(), true),
+            0xef53 => ("ext4".to_string(), false),
+            0x0102_1994 => ("tmpfs".to_string(), false),
+            0x2fc1_2fc1 => ("zfs".to_string(), false),
+            other => (format!("0x{other:x}"), false),
+        };
+        let mut mount = fs::canonicalize(path)?;
+        while let Some(parent) = mount.parent() {
+            if fs::metadata(parent)?.dev() != dev {
+                break;
+            }
+            mount = parent.to_path_buf();
+        }
+        Ok(VolumeInfo { dev, mount, fs_type, clones, free: free_bytes(path)? })
+    }
 }
 
-/// statvfs `f_bavail * f_frsize`. The only source of the "freed" number onemodel reports.
+fn statfs(path: &Path) -> io::Result<libc::statfs> {
+    let c = c_path(path)?;
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c` is NUL-terminated; `st` is a valid out-pointer that statfs fills on success.
+    let rc = unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statfs returned 0, so it initialized `st`.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// Free bytes for an unprivileged writer. The only source of the "freed" number onemodel reports.
+/// macOS: statfs `f_bavail * f_bsize` (statvfs counts are 32-bit there). Linux: statvfs
+/// `f_bavail * f_frsize`.
 pub fn free_bytes(path: &Path) -> io::Result<u64> {
-    let _ = path;
-    todo!()
+    #[cfg(target_os = "macos")]
+    {
+        let st = statfs(path)?;
+        Ok(st.f_bavail * u64::from(st.f_bsize))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let c = c_path(path)?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `c` is NUL-terminated; `st` is a valid out-pointer that statvfs fills on success.
+        let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: statvfs returned 0, so it initialized `st`.
+        let st = unsafe { st.assume_init() };
+        Ok(st.f_bavail as u64 * st.f_frsize as u64)
+    }
 }
 
 /// Make `to` carry `from`'s metadata: remove every xattr on `to`, set every xattr of `from`
