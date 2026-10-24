@@ -451,6 +451,22 @@ fn dedupe_replaces_targets_preserving_metadata_and_store_integrity() {
 }
 
 #[test]
+fn dedupe_human_output_is_short_and_names_each_file() {
+    let Some(fx) = Fixture::new() else { return };
+    let out = fx.run(&["dedupe"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let human = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = human.lines().collect();
+    assert_eq!(lines.len(), 7, "{human}");
+    assert!(lines.contains(&format!("replaced  ~/{LLAMA_A}  (clone of ~/{LM_A})").as_str()), "{human}");
+    assert!(lines[6].starts_with("freed "), "{human}");
+    let verify = String::from_utf8(fx.run(&["verify"]).stdout).unwrap();
+    assert_eq!(verify, "ok: 9 managed files (37.7 MB) hashed, 6 store claims checked in 5 stores\n");
+    let again = String::from_utf8(fx.run(&["dedupe"]).stdout).unwrap();
+    assert_eq!(again, "nothing to replace; 6 files are already shared\n");
+}
+
+#[test]
 fn verify_fails_on_changed_managed_bytes_and_broken_store_links() {
     let Some(fx) = Fixture::new() else { return };
     fx.json(&["dedupe"]);
@@ -634,6 +650,8 @@ fn refuses_file_open_by_a_process() {
     );
     assert_eq!(report["results"].as_array().unwrap().len(), 5);
     assert_eq!(fs::metadata(fx.path(OLLAMA_A)).unwrap().ino(), original);
+    let human = String::from_utf8(fx.run(&["dedupe", "--dry-run"]).stdout).unwrap();
+    assert!(human.contains(&format!("open by sleep (pid {})", holder.0.id())), "{human}");
 
     drop(holder);
     assert_eq!(fx.outcomes(&fx.json(&["dedupe"])), pairs(&[(OLLAMA_A, "replaced")]));

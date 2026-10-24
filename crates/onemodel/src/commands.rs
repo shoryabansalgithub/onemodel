@@ -455,8 +455,52 @@ impl Report for ScanReport {
 }
 
 impl Report for DedupeReport {
-    fn human(&self, _env: &Env) -> String {
-        format!("{} ops\n", self.results.len())
+    fn human(&self, env: &Env) -> String {
+        let mut out = String::new();
+        if self.resumed {
+            let run = self.run.as_ref().map_or_else(String::new, |r| format!(" {r}"));
+            out.push_str(&format!("resuming interrupted run{run}\n"));
+        }
+        if self.dry_run {
+            out.push_str(&groups_text(env, &self.plan.groups));
+            out.push_str(&format!(
+                "dry run: would clone {} and free up to {}{}\n",
+                plural(self.plan.op_count(), "file"),
+                fmt_bytes(self.plan.reclaimable()),
+                tally(&self.plan.groups)
+            ));
+            return out;
+        }
+        let mut lines = Vec::new();
+        for r in &self.results {
+            match &r.outcome {
+                Outcome::Replaced => {
+                    let how = if self.mode == Mode::Hardlink { "hard link to" } else { "clone of" };
+                    lines.push(row("replaced", &format!("{}  ({how} {})", env.show(&r.target), env.show(&r.keeper))));
+                }
+                Outcome::Refused { refusal } => {
+                    lines.push(row("refused", &format!("{}  {refusal}", env.show(&r.target))));
+                }
+                Outcome::AlreadyIndependent { .. } | Outcome::Restored => {}
+            }
+        }
+        for m in self.plan.groups.iter().flat_map(|g| &g.members) {
+            if let Role::Refused { refusal } = &m.role {
+                lines.push(row("refused", &format!("{}  {refusal}", env.show(&m.path))));
+            }
+        }
+        out.push_str(&lines.concat());
+        if self.results.is_empty() {
+            let shared = count_roles(&self.plan.groups, |r| matches!(r, Role::Shared));
+            out.push_str(&match shared {
+                0 if self.plan.groups.is_empty() => "no duplicates found\n".to_string(),
+                0 => "nothing to replace\n".to_string(),
+                1 => "nothing to replace; 1 file is already shared\n".to_string(),
+                n => format!("nothing to replace; {n} files are already shared\n"),
+            });
+        }
+        out.push_str(&space_text(env, &self.space));
+        out
     }
     fn exit(&self) -> Exit {
         Exit::Ok
