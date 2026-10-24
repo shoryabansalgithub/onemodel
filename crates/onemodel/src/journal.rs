@@ -7,8 +7,9 @@
 //! ```
 //!
 //! Write discipline: `RunWriter::append` writes one complete line with a single `write_all` and
-//! then `sync_all` (F_FULLFSYNC on macOS) before returning. Creating a run file also fsyncs `runs/`.
-//! So when any record is observable after a crash, every earlier record is too.
+//! then `sync_all` (F_FULLFSYNC on macOS) before returning. A run file appears in `runs/` only by
+//! renaming a fully written and fsynced `.tmp` holding the Plan record, so a run file always starts
+//! with a complete Plan. When any record is observable after a crash, every earlier record is too.
 //!
 //! Read discipline: `replay` parses every line. A final line without its newline is a torn append
 //! (the write never completed, so the action it guarded never started) and is dropped; `reopen`
@@ -104,6 +105,7 @@ pub enum Record {
         refusal: Refusal,
     },
     /// Every op is terminal (Done or Refused) or was left Pending by an aborting `undo`.
+    /// `free_after` is (dev, free bytes) per plan volume.
     End {
         free_after: Vec<(u64, u64)>,
     },
@@ -216,16 +218,39 @@ impl Journal {
         Ok(runs)
     }
 
-    /// Create `runs/<id>.jsonl` with O_EXCL, append the Plan record, fsync file and `runs/`.
+    /// Write the Plan record to `runs/<id>.jsonl.tmp`, fsync, rename into place, fsync `runs/`.
     pub fn begin(&self, plan: Plan) -> anyhow::Result<(RunWriter, RunLog)> {
-        let _ = plan;
-        todo!()
+        let id = RunId::new();
+        let file = self.runs_dir().join(format!("{id}.jsonl"));
+        let tmp = file.with_extension("jsonl.tmp");
+        let ops = vec![OpState::Pending; plan.op_count() as usize];
+        let rec = Record::Plan { v: FORMAT_VERSION, run: id.clone(), plan };
+        let mut line = serde_json::to_vec(&rec)?;
+        line.push(b'\n');
+        {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(&line)?;
+            f.sync_all()?;
+        }
+        if file.exists() {
+            bail!("run file {} already exists", file.display());
+        }
+        fs::rename(&tmp, &file)?;
+        platform::fsync_dir(&self.runs_dir())?;
+        let Record::Plan { plan, .. } = rec else { unreachable!() };
+        let log = RunLog { id, plan, ops, ended: false, file, valid_len: line.len() as u64 };
+        let writer = self.reopen(&log)?;
+        Ok((writer, log))
     }
 
-    /// Append to an existing run (resume, undo).
+    /// Append to an existing run (resume, undo), first cutting off any torn final line.
     pub fn reopen(&self, run: &RunLog) -> anyhow::Result<RunWriter> {
-        let _ = run;
-        todo!()
+        let file = OpenOptions::new().append(true).open(&run.file)?;
+        if file.metadata()?.len() != run.valid_len {
+            file.set_len(run.valid_len)?;
+            file.sync_all()?;
+        }
+        Ok(RunWriter { file })
     }
 }
 
@@ -237,8 +262,11 @@ impl RunWriter {
     /// Serialize, append one line, `sync_all`. Returns only once the record is durable.
     /// An error here aborts the command: we must never act on a record we could not persist.
     pub fn append(&mut self, rec: &Record) -> anyhow::Result<()> {
-        let _ = (&self.file, rec);
-        todo!()
+        let mut line = serde_json::to_vec(rec)?;
+        line.push(b'\n');
+        self.file.write_all(&line).context("cannot write the journal")?;
+        self.file.sync_all().context("cannot fsync the journal")?;
+        Ok(())
     }
 }
 
