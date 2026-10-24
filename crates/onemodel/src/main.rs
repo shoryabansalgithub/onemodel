@@ -162,13 +162,32 @@ impl Env {
         }
     }
 
-    /// `path` with the home directory written as `~`, for human output.
+    /// `path` for human output: the home directory as `~`, and content digests in blob names
+    /// (40 or more hex digits) cut to their first 12. `--json` always has full paths.
     pub fn show(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.home) {
+        let full = match path.strip_prefix(&self.home) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => path.display().to_string(),
+        };
+        let mut out = String::new();
+        let mut run = String::new();
+        for c in full.chars().chain(std::iter::once('/')) {
+            if c.is_ascii_hexdigit() {
+                run.push(c);
+                continue;
+            }
+            if run.len() >= 40 {
+                out.push_str(&run[..12]);
+                out.push('\u{2026}');
+            } else {
+                out.push_str(&run);
+            }
+            run.clear();
+            out.push(c);
         }
+        out.pop();
+        out
     }
 }
 
@@ -251,6 +270,12 @@ fn parse_size(s: &str) -> Result<u64, String> {
         _ => return Err(format!("{s:?} is not a size like 500M or 2G")),
     };
     n.checked_mul(1 << shift).ok_or_else(|| format!("{s:?} is too large"))
+}
+
+/// `1 file`, `2 files`.
+pub fn plural(n: impl Into<u64>, noun: &str) -> String {
+    let n = n.into();
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
 }
 
 /// Human byte count in decimal GB/MB (matches Finder and `df -H`, which is how users check savings).

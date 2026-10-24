@@ -10,11 +10,11 @@ use serde::Serialize;
 
 use crate::journal::{self, CrashPoint, Journal, Record, RunId, RunLog, RunWriter, crash_point};
 use crate::matching::{self, Fingerprint, Unreadable};
-use crate::plan::{self, GroupPlan, Mode, Plan, Volume};
+use crate::plan::{self, GroupPlan, Mode, Plan, Role, Volume};
 use crate::platform;
 use crate::replace::{self, Ctx, Outcome};
 use crate::stores::{self, Claim, Store};
-use crate::{Env, Exit, Report};
+use crate::{Env, Exit, Report, fmt_bytes, plural};
 
 #[derive(Serialize)]
 pub struct ScanReport {
@@ -421,8 +421,33 @@ fn check_hash(report: &mut VerifyReport, path: PathBuf, expected: matching::Hash
 }
 
 impl Report for ScanReport {
-    fn human(&self, _env: &Env) -> String {
-        format!("{} duplicate groups, {} bytes reclaimable\n", self.groups.len(), self.reclaimable)
+    fn human(&self, env: &Env) -> String {
+        let mut out = String::new();
+        if self.stores.is_empty() {
+            out.push_str("no model stores found\n");
+        } else {
+            out.push_str("stores\n");
+            out.push_str(&stores_table(env, &self.stores));
+        }
+        out.push_str(&groups_text(env, &self.groups));
+        for u in &self.unreadable {
+            out.push_str(&format!("unreadable {}: {}\n", env.show(&u.path), u.error));
+        }
+        for r in &self.runs {
+            out.push_str(&format!(
+                "run {} manages {} ({})\n",
+                r.id,
+                plural(r.managed_files, "file"),
+                fmt_bytes(r.managed_bytes)
+            ));
+        }
+        if let Some(run) = &self.interrupted {
+            out.push_str(&format!(
+                "run {run} was interrupted: `onemodel dedupe` finishes it, `onemodel undo` reverts it\n"
+            ));
+        }
+        out.push_str(&format!("reclaimable {}{}\n", fmt_bytes(self.reclaimable), tally(&self.groups)));
+        out
     }
     fn exit(&self) -> Exit {
         Exit::Ok
@@ -455,4 +480,87 @@ impl Report for VerifyReport {
     fn exit(&self) -> Exit {
         if self.problems.is_empty() { Exit::Ok } else { Exit::Problems }
     }
+}
+
+fn row(label: &str, rest: &str) -> String {
+    format!("{label:<9} {rest}\n")
+}
+
+fn stores_table(env: &Env, stores: &[Store]) -> String {
+    let roots: Vec<String> = stores.iter().map(|s| env.show(&s.root)).collect();
+    let kind_w = stores.iter().map(|s| s.kind.len()).max().unwrap_or(0);
+    let root_w = roots.iter().map(String::len).max().unwrap_or(0);
+    let mut out = String::new();
+    for (s, root) in stores.iter().zip(&roots) {
+        let mut line = format!(
+            "  {:<kind_w$}  {:<root_w$}  {:>9}  {:>9}",
+            s.kind,
+            root,
+            plural(s.files, "file"),
+            fmt_bytes(s.bytes)
+        );
+        if let Some(marker) = &s.downloading {
+            line.push_str(&format!("  downloading ({})", env.show(marker)));
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn groups_text(env: &Env, groups: &[GroupPlan]) -> String {
+    let mut out = String::new();
+    if !groups.is_empty() {
+        out.push_str("duplicates\n");
+    }
+    for g in groups {
+        let head = format!("  {:>9}  {}", fmt_bytes(g.size), &g.hash.hex()[..8]);
+        for (i, m) in g.members.iter().enumerate() {
+            let lead = if i == 0 { head.clone() } else { " ".repeat(head.len()) };
+            let (label, why) = match &m.role {
+                Role::Keeper => ("keep", String::new()),
+                Role::Target { .. } => ("clone", String::new()),
+                Role::Shared => ("shared", String::new()),
+                Role::Refused { refusal } => ("refuse", format!("  {refusal}")),
+            };
+            out.push_str(&format!("{lead}  {label:<6}  {}{why}\n", env.show(&m.path)));
+        }
+    }
+    out
+}
+
+fn count_roles(groups: &[GroupPlan], f: impl Fn(&Role) -> bool) -> usize {
+    groups.iter().flat_map(|g| &g.members).filter(|m| f(&m.role)).count()
+}
+
+/// ` (3 to clone, 1 refused, 2 already shared)`, leaving out zero counts.
+fn tally(groups: &[GroupPlan]) -> String {
+    let parts: Vec<String> = [
+        (count_roles(groups, |r| matches!(r, Role::Target { .. })), "to clone"),
+        (count_roles(groups, |r| matches!(r, Role::Refused { .. })), "refused"),
+        (count_roles(groups, |r| matches!(r, Role::Shared)), "already shared"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) }
+}
+
+/// One line per volume from statfs: `freed 4.37 GB on / (free 112.40 GB -> 116.77 GB)`, or
+/// `used` when free space fell.
+fn space_text(env: &Env, space: &[SpaceDelta]) -> String {
+    space
+        .iter()
+        .map(|d| {
+            let verb = if d.free_after >= d.free_before { "freed" } else { "used" };
+            format!(
+                "{verb} {} on {} (free {} -> {})\n",
+                fmt_bytes(d.free_after.abs_diff(d.free_before)),
+                env.show(&d.mount),
+                fmt_bytes(d.free_before),
+                fmt_bytes(d.free_after)
+            )
+        })
+        .collect()
 }

@@ -401,6 +401,11 @@ fn scan_reports_groups_and_changes_nothing() {
     assert_eq!(stores, expected.map(|(k, n)| (k.to_string(), n)));
     assert_eq!(disk(&fx), before);
     assert_eq!(fx.run_files(), Vec::<String>::new());
+
+    let human = String::from_utf8(fx.run(&["scan"]).stdout).unwrap();
+    assert!(human.contains("keep    ~/.lmstudio/models/pub/repo/a.gguf\n"), "{human}");
+    assert!(human.contains(&format!("clone   ~/{}\n", LLAMA_A)), "{human}");
+    assert!(human.ends_with("reclaimable 25.2 MB (6 to clone)\n"), "{human}");
 }
 
 #[test]
@@ -850,6 +855,9 @@ fn refuses_across_volumes_and_without_clone_support() {
         json!({"reason": "no_clone_support", "fs_type": "hfs"})
     );
     assert_eq!(fx.outcomes(&report), six_replaced());
+    let human = String::from_utf8(fx.run(&["scan"]).stdout).unwrap();
+    assert!(human.contains("the hfs filesystem does not support clones"), "{human}");
+    assert!(human.contains("no other copy on this volume, and clones cannot cross volumes"), "{human}");
 }
 
 #[test]
