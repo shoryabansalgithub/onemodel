@@ -131,6 +131,10 @@ pub struct Matches {
     pub unreadable: Vec<Unreadable>,
 }
 
+/// Bytes read from each of the head, middle and tail of a file for the sampled hash.
+const SAMPLE: u64 = 1 << 20;
+const BUF: usize = 8 << 20;
+
 /// The matching pipeline.
 ///
 /// 1. collapse paths by `FileId`; bucket inodes by size; drop buckets with one inode.
@@ -148,11 +152,52 @@ pub fn find_duplicates(files: Vec<FoundFile>) -> Matches {
 
 /// Full BLAKE3 of one file, read loop with an 8 MiB buffer.
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
-    todo!("{path:?}")
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; BUF];
+    loop {
+        let n = read_full(&mut file, &mut buf)?;
+        if n == 0 {
+            return Ok(Hash(*hasher.finalize().as_bytes()));
+        }
+        hasher.update(&buf[..n]);
+    }
 }
 
 /// Byte-for-byte compare. `Ok(None)` = same length and same bytes; `Ok(Some(off))` = first
 /// differing byte offset (or the shorter length).
 pub fn first_difference(a: &Path, b: &Path) -> io::Result<Option<u64>> {
-    todo!("{a:?} {b:?}: two 8 MiB buffers, read_exact chunks, memcmp")
+    let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; BUF], vec![0u8; BUF]);
+    let mut offset = 0u64;
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        let n = na.min(nb);
+        if ba[..n] != bb[..n] {
+            let at = ba[..n].iter().zip(&bb[..n]).position(|(x, y)| x != y).unwrap_or(n);
+            return Ok(Some(offset + at as u64));
+        }
+        if na != nb {
+            return Ok(Some(offset + n as u64));
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        offset += n as u64;
+    }
+}
+
+/// Fill `buf` unless EOF comes first. Returns the bytes read.
+fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match file.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
 }
