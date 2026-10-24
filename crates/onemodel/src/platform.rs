@@ -1,14 +1,19 @@
 //! Every OS call whose behaviour differs between macOS and Linux, and the crate's only `unsafe`.
 //!
 //! Each function has one signature and two `#[cfg]` bodies inside it; no other module mentions a
-//! target OS. The e2e suite exercises whichever body the host compiles; CI runs it on macOS (APFS,
-//! plus hdiutil-made HFS+ and second-APFS volumes) and Linux (tmpfs at /dev/shm as the
-//! no-clone / other-volume case; btrfs only when `ONEMODEL_TEST_BTRFS` names a mounted dir).
+//! target OS. The e2e suite exercises whichever body the host compiles.
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("onemodel supports macOS and Linux only");
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io;
+use std::ffi::CString;
+use std::fs::{self, File, FileTimes, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,14 +25,51 @@ pub enum CloneError {
     Io(io::Error),
 }
 
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has a NUL"))
+}
+
+fn clone_error(e: io::Error) -> CloneError {
+    match e.raw_os_error() {
+        Some(libc::ENOTSUP) => CloneError::Unsupported { errno_name: "ENOTSUP" },
+        Some(libc::EOPNOTSUPP) => CloneError::Unsupported { errno_name: "EOPNOTSUPP" },
+        Some(libc::EXDEV) => CloneError::Unsupported { errno_name: "EXDEV" },
+        #[cfg(target_os = "linux")]
+        Some(libc::EINVAL) => CloneError::Unsupported { errno_name: "EINVAL" },
+        _ => CloneError::Io(e),
+    }
+}
+
 /// Create `dst` (must not exist) as a copy-on-write clone of `src`.
 /// macOS: `clonefile(src, dst, CLONE_NOFOLLOW | CLONE_NOOWNERCOPY)`. Note it copies the SOURCE's
 /// mode, ACL and xattrs; `copy_metadata` must run after it.
 /// Linux: open src O_RDONLY, create dst O_WRONLY|O_CREAT|O_EXCL 0600, `ioctl(dst, FICLONE, src)`;
 /// on failure unlink dst.
 pub fn clone_file(src: &Path, dst: &Path) -> Result<(), CloneError> {
-    let _ = (src, dst);
-    todo!()
+    #[cfg(target_os = "macos")]
+    {
+        const CLONE_NOFOLLOW: u32 = 0x0001;
+        const CLONE_NOOWNERCOPY: u32 = 0x0002;
+        let (s, d) = (c_path(src).map_err(CloneError::Io)?, c_path(dst).map_err(CloneError::Io)?);
+        // SAFETY: `s` and `d` are NUL-terminated and outlive the call.
+        let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW | CLONE_NOOWNERCOPY) };
+        if rc == 0 { Ok(()) } else { Err(clone_error(io::Error::last_os_error())) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let s = File::open(src).map_err(CloneError::Io)?;
+        let d = OpenOptions::new().write(true).create_new(true).mode(0o600).open(dst).map_err(CloneError::Io)?;
+        // SAFETY: both descriptors are open for the duration of the call; FICLONE takes an fd argument.
+        let rc = unsafe { libc::ioctl(d.as_raw_fd(), libc::FICLONE, s.as_raw_fd()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        drop(d);
+        let _ = fs::remove_file(dst);
+        Err(clone_error(err))
+    }
 }
 
 /// Facts about the volume holding `path`.
