@@ -444,3 +444,46 @@ fn dedupe_replaces_targets_preserving_metadata_and_store_integrity() {
     assert_eq!(fx.run_files().len(), 1);
     assert_eq!(disk(&fx), before);
 }
+
+#[test]
+fn verify_fails_on_changed_managed_bytes_and_broken_store_links() {
+    let Some(fx) = Fixture::new() else { return };
+    fx.json(&["dedupe"]);
+    let mut f = OpenOptions::new().write(true).open(fx.path(LLAMA_A)).unwrap();
+    f.seek(SeekFrom::Start(7)).unwrap();
+    f.write_all(b"x").unwrap();
+    drop(f);
+    let sc = &digests()[2];
+    fs::remove_file(fx.home.join(format!("hf/hub/models--org--c/blobs/{sc}"))).unwrap();
+
+    let verify = fx.json_code(&["verify"], 2);
+    let problems: Vec<(String, String)> = verify["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let path = p.get("path").or_else(|| p.get("link")).unwrap().as_str().unwrap();
+            (p["kind"].as_str().unwrap().to_string(), fx.name(path))
+        })
+        .collect();
+    assert_eq!(
+        problems,
+        vec![
+            ("content_changed".to_string(), LLAMA_A.to_string()),
+            ("link_broken".to_string(), "hf/hub/models--org--c/snapshots/rev2/c.gguf".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn verify_deep_checks_every_ollama_blob_against_its_manifest() {
+    let Some(fx) = Fixture::new() else { return };
+    let mut f = OpenOptions::new().write(true).open(fx.path(OLLAMA_B)).unwrap();
+    f.write_all(b"corrupt").unwrap();
+    drop(f);
+    assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+    let deep = fx.json_code(&["verify", "--deep"], 2);
+    assert_eq!(deep["problems"].as_array().unwrap().len(), 1);
+    assert_eq!(deep["problems"][0]["kind"], json!("claim_digest_mismatch"));
+    assert_eq!(fx.name(deep["problems"][0]["path"].as_str().unwrap()), OLLAMA_B);
+}
