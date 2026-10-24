@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::journal::Managed;
 use crate::matching::{FileId, Fingerprint, Hash, Matches, Unreadable};
-use crate::platform::{self, Holder};
-use crate::stores::{Inventory, Store, StoreIx};
+use crate::platform::{self, Holder, Volume};
+use crate::stores::{Store, StoreIx};
 use crate::{Env, fmt_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,16 +37,6 @@ pub struct Plan {
     /// Sorted (size desc, hash). Op indices are assigned in (group, member) order.
     pub groups: Vec<GroupPlan>,
     pub unreadable: Vec<Unreadable>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Volume {
-    pub dev: u64,
-    pub mount: PathBuf,
-    pub fs_type: String,
-    /// statfs-level belief; the clone call itself is the final word (ENOTSUP -> NoCloneSupport).
-    pub clones: bool,
-    pub free_before: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +195,13 @@ impl Plan {
 ///
 /// `managed` (from the journal) makes repeated runs idempotent: existing clones become `Shared`
 /// and their keeper stays the keeper.
-pub fn make_plan(env: &Env, inv: Inventory, matches: Matches, mode: Mode, managed: &[Managed]) -> anyhow::Result<Plan> {
+pub fn make_plan(
+    env: &Env,
+    stores: Vec<Store>,
+    matches: Matches,
+    mode: Mode,
+    managed: &[Managed],
+) -> anyhow::Result<Plan> {
     let mut volumes: Vec<Volume> = Vec::new();
     let mut acl = BTreeSet::new();
     let mut paths: Vec<&Path> = Vec::new();
@@ -213,14 +209,7 @@ pub fn make_plan(env: &Env, inv: Inventory, matches: Matches, mode: Mode, manage
         for inode in &g.inodes {
             let path = &inode.paths[0].0;
             if !volumes.iter().any(|v| v.dev == inode.stat.id.dev) {
-                let info = platform::volume(path)?;
-                volumes.push(Volume {
-                    dev: info.dev,
-                    mount: info.mount,
-                    fs_type: info.fs_type,
-                    clones: info.clones,
-                    free_before: info.free,
-                });
+                volumes.push(platform::volume(path)?);
             }
             if platform::has_acl(path).unwrap_or(false) {
                 acl.insert(path.clone());
@@ -229,16 +218,17 @@ pub fn make_plan(env: &Env, inv: Inventory, matches: Matches, mode: Mode, manage
         }
     }
     let holders = platform::open_holders(&env.lsof(), &paths);
-    let facts = Facts { inv: &inv, volumes: &volumes, holders: &holders, acl: &acl, euid: platform::euid(), managed };
+    let facts =
+        Facts { stores: &stores, volumes: &volumes, holders: &holders, acl: &acl, euid: platform::euid(), managed };
     let groups = decide(&facts, matches.groups, mode);
-    let plan = Plan { mode, stores: inv.stores.clone(), volumes, groups, unreadable: matches.unreadable };
+    let plan = Plan { mode, stores, volumes, groups, unreadable: matches.unreadable };
     debug_assert_plan(&plan);
     Ok(plan)
 }
 
 /// Facts `make_plan` gathers with I/O before deciding.
 struct Facts<'a> {
-    inv: &'a Inventory,
+    stores: &'a [Store],
     volumes: &'a [Volume],
     holders: &'a Result<BTreeMap<PathBuf, Vec<Holder>>, String>,
     acl: &'a BTreeSet<PathBuf>,
@@ -267,7 +257,7 @@ fn decide(facts: &Facts<'_>, groups: Vec<crate::matching::DupGroup>, mode: Mode)
         let mut roles: Vec<Option<Role>> = vec![None; g.inodes.len()];
         for (ix, inode) in g.inodes.iter().enumerate() {
             let downloading = inode.paths.iter().find_map(|(_, s)| {
-                let store = &facts.inv.stores[s.0 as usize];
+                let store = &facts.stores[s.0 as usize];
                 store.downloading.as_ref().map(|m| (store.kind.clone(), m.clone()))
             });
             if let Some((store, marker)) = downloading {
@@ -295,18 +285,15 @@ fn decide(facts: &Facts<'_>, groups: Vec<crate::matching::DupGroup>, mode: Mode)
                 })
                 .expect("partitions are non-empty")
         };
-        let home =
-            by_dev.iter().max_by_key(|(_, ixs)| (ixs.len(), Reverse(ixs[0]))).map(|(dev, ixs)| (*dev, keeper_of(ixs)));
+        let volume_of =
+            |dev: u64| facts.volumes.iter().find(|v| v.dev == dev).expect("every member's volume was measured");
+        let home = by_dev.iter().max_by_key(|(_, ixs)| (ixs.len(), Reverse(ixs[0]))).map(|(dev, _)| volume_of(*dev));
         for (dev, ixs) in &by_dev {
             let keeper = keeper_of(ixs);
-            let vol = facts.volumes.iter().find(|v| v.dev == *dev).expect("every member's volume was measured");
+            let vol = volume_of(*dev);
             match home {
-                Some((home_dev, home_keeper)) if ixs.len() == 1 && *dev != home_dev => {
-                    let keeper_mount = facts
-                        .volumes
-                        .iter()
-                        .find(|v| v.dev == g.inodes[home_keeper].stat.id.dev)
-                        .map_or_else(PathBuf::new, |v| v.mount.clone());
+                Some(home) if ixs.len() == 1 && *dev != home.dev => {
+                    let keeper_mount = home.mount.clone();
                     roles[keeper] = Some(Role::Refused { refusal: Refusal::DifferentVolume { keeper_mount } });
                     continue;
                 }

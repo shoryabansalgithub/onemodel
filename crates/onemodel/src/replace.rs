@@ -58,7 +58,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::journal::{CrashPoint, OpState, Record, RunId, RunWriter, crash_point};
+use crate::journal::{CrashPoint, OpState, Record, RunId, RunLog, RunWriter, crash_point};
 use crate::matching::{Fingerprint, first_difference};
 use crate::plan::{Mode, Op, Plan, Refusal};
 use crate::platform::{self, CloneError};
@@ -68,9 +68,14 @@ use crate::stores;
 pub struct Ctx<'a> {
     pub run: &'a RunId,
     pub plan: &'a Plan,
-    pub mode: Mode,
     pub lsof: &'a Path,
     pub writer: &'a mut RunWriter,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn new(run: &'a RunLog, lsof: &'a Path, writer: &'a mut RunWriter) -> Ctx<'a> {
+        Ctx { run: &run.id, plan: &run.plan, lsof, writer }
+    }
 }
 
 /// Terminal result of one op for the report.
@@ -144,7 +149,7 @@ fn staged_disk_state(cx: &Ctx<'_>, op: &Op<'_>, ino: u64) -> anyhow::Result<Stag
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StagedDisk::Gone),
         Err(e) => return Err(e.into()),
     };
-    let planned_mtime = if cx.mode == Mode::Clone { op.target.stat.mtime_ns } else { op.keeper.stat.mtime_ns };
+    let planned_mtime = if cx.plan.mode == Mode::Clone { op.target.stat.mtime_ns } else { op.keeper.stat.mtime_ns };
     if now.id.ino == ino && now.id.dev == op.target.stat.id.dev && now.size == op.size && now.mtime_ns == planned_mtime
     {
         Ok(StagedDisk::Renamed)
@@ -156,10 +161,21 @@ fn staged_disk_state(cx: &Ctx<'_>, op: &Op<'_>, ino: u64) -> anyhow::Result<Stag
 }
 
 fn finish_rename(cx: &mut Ctx<'_>, op: &Op<'_>) -> anyhow::Result<Outcome> {
-    platform::fsync_dir(parent(&op.target.path))?;
+    platform::fsync(parent(&op.target.path))?;
     cx.writer.append(&Record::Done { op: op.ix })?;
     crash_point(CrashPoint::AfterDone);
     Ok(Outcome::Replaced)
+}
+
+fn finish_undo_rename(cx: &mut Ctx<'_>, op: &Op<'_>) -> anyhow::Result<Outcome> {
+    platform::fsync(parent(&op.target.path))?;
+    cx.writer.append(&Record::Undone { op: op.ix, note: None })?;
+    Ok(Outcome::Restored)
+}
+
+/// The target is still the file the plan fingerprinted.
+fn target_unchanged(op: &Op<'_>) -> bool {
+    Fingerprint::of(&op.target.path).is_ok_and(|now| op.target.stat.same_file_unchanged(&now))
 }
 
 fn refuse(cx: &mut Ctx<'_>, op: &Op<'_>, refusal: Refusal) -> anyhow::Result<Outcome> {
@@ -181,8 +197,7 @@ fn replace(cx: &mut Ctx<'_>, op: Op<'_>) -> anyhow::Result<Outcome> {
     cx.writer.append(&Record::Staged { op: op.ix, ino })?;
     crash_point(CrashPoint::AfterStaged);
 
-    let unchanged = Fingerprint::of(&op.target.path).is_ok_and(|now| op.target.stat.same_file_unchanged(&now));
-    if !unchanged {
+    if !target_unchanged(&op) {
         remove_if_present(&temp)?;
         return refuse(cx, &op, Refusal::ChangedSinceScan);
     }
@@ -196,9 +211,8 @@ fn replace(cx: &mut Ctx<'_>, op: Op<'_>) -> anyhow::Result<Outcome> {
 
 /// Step 0: is the plan still true for this op, right now?
 fn revalidate(cx: &Ctx<'_>, op: &Op<'_>) -> Result<(), Refusal> {
-    let unchanged = Fingerprint::of(&op.target.path).is_ok_and(|now| op.target.stat.same_file_unchanged(&now));
     let keeper_same = Fingerprint::of(&op.keeper.path).is_ok_and(|now| now.id == op.keeper.stat.id);
-    if !unchanged || !keeper_same {
+    if !target_unchanged(op) || !keeper_same {
         return Err(Refusal::ChangedSinceScan);
     }
     for path in [&op.keeper.path, &op.target.path] {
@@ -227,7 +241,7 @@ fn open_check(lsof: &Path, path: &Path) -> Result<(), Refusal> {
 
 /// Steps 1-3: a temp next to the target that is byte-identical to it and carries its metadata.
 fn prepare(cx: &Ctx<'_>, op: &Op<'_>, temp: &Path) -> Result<(), Refusal> {
-    match cx.mode {
+    match cx.plan.mode {
         Mode::Clone => platform::clone_file(&op.keeper.path, temp).map_err(|e| match e {
             CloneError::Unsupported => Refusal::NoCloneSupport {
                 fs_type: cx.plan.volume(op.target.stat.id.dev).map_or_else(String::new, |v| v.fs_type.clone()),
@@ -237,16 +251,11 @@ fn prepare(cx: &Ctx<'_>, op: &Op<'_>, temp: &Path) -> Result<(), Refusal> {
         Mode::Hardlink => fs::hard_link(&op.keeper.path, temp).map_err(|e| io_refusal("hard link", e))?,
     }
     crash_point(CrashPoint::AfterClone);
-    if cx.mode == Mode::Clone {
+    if cx.plan.mode == Mode::Clone {
         platform::copy_metadata(&op.target.path, temp).map_err(|e| io_refusal("metadata copy", e))?;
         crash_point(CrashPoint::AfterMetadata);
     }
-    platform::fsync_file(temp).map_err(|e| io_refusal("fsync", e))?;
-    match first_difference(temp, &op.target.path) {
-        Ok(None) => {}
-        Ok(Some(offset)) => return Err(Refusal::ContentMismatch { offset }),
-        Err(e) => return Err(io_refusal("compare", e)),
-    }
+    seal(temp, &op.target.path)?;
     crash_point(CrashPoint::AfterCompare);
     Ok(())
 }
@@ -260,9 +269,7 @@ pub fn drive_undo(cx: &mut Ctx<'_>, op: Op<'_>, state: &OpState) -> anyhow::Resu
         OpState::Pending | OpState::Staged { .. } | OpState::Refused(_) | OpState::Undone => return Ok(None),
     };
     if staged_ino.is_some() && target_ino(&op)? == staged_ino {
-        platform::fsync_dir(parent(&op.target.path))?;
-        cx.writer.append(&Record::Undone { op: op.ix, note: None })?;
-        return Ok(Some(Outcome::Restored));
+        return finish_undo_rename(cx, &op).map(Some);
     }
     remove_if_present(&undo_temp_path(cx.run, &op))?;
     undo_done(cx, op, done_ino).map(Some)
@@ -318,9 +325,7 @@ fn undo_done(cx: &mut Ctx<'_>, op: Op<'_>, done_ino: u64) -> anyhow::Result<Outc
         return undo_refuse(cx, &op, io_refusal("rename", e));
     }
     crash_point(CrashPoint::UndoAfterRename);
-    platform::fsync_dir(parent(&op.target.path))?;
-    cx.writer.append(&Record::Undone { op: op.ix, note: None })?;
-    Ok(Outcome::Restored)
+    finish_undo_rename(cx, &op)
 }
 
 /// An independent copy of the target's current bytes and metadata at `temp`, fsynced and compared.
@@ -328,18 +333,23 @@ fn undo_done(cx: &mut Ctx<'_>, op: Op<'_>, done_ino: u64) -> anyhow::Result<Outc
 fn rematerialize(cx: &Ctx<'_>, op: &Op<'_>, temp: &Path) -> Result<(), Refusal> {
     platform::real_copy(&op.target.path, temp).map_err(|e| io_refusal("copy", e))?;
     platform::copy_metadata(&op.target.path, temp).map_err(|e| io_refusal("metadata copy", e))?;
-    if cx.mode == Mode::Hardlink {
+    if cx.plan.mode == Mode::Hardlink {
         platform::set_mode_and_mtime(temp, op.target.stat.mode, op.target.stat.mtime_ns)
             .map_err(|e| io_refusal("metadata copy", e))?;
     }
-    platform::fsync_file(temp).map_err(|e| io_refusal("fsync", e))?;
-    match first_difference(temp, &op.target.path) {
-        Ok(None) => {}
-        Ok(Some(offset)) => return Err(Refusal::ContentMismatch { offset }),
-        Err(e) => return Err(io_refusal("compare", e)),
-    }
+    seal(temp, &op.target.path)?;
     crash_point(CrashPoint::UndoAfterCopy);
     Ok(())
+}
+
+/// Step 3 for both directions: fsync the temp, then prove it holds exactly the target's bytes.
+fn seal(temp: &Path, target: &Path) -> Result<(), Refusal> {
+    platform::fsync(temp).map_err(|e| io_refusal("fsync", e))?;
+    match first_difference(temp, target) {
+        Ok(None) => Ok(()),
+        Ok(Some(offset)) => Err(Refusal::ContentMismatch { offset }),
+        Err(e) => Err(io_refusal("compare", e)),
+    }
 }
 
 fn io_refusal(step: &str, e: io::Error) -> Refusal {

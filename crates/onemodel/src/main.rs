@@ -138,29 +138,18 @@ impl Env {
         self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
     }
 
-    /// Where the journal and lock live. `--state` / `ONEMODEL_STATE` wins; else macOS
-    /// `~/Library/Application Support/onemodel`, Linux `$XDG_STATE_HOME/onemodel` or
-    /// `~/.local/state/onemodel`.
+    /// Where the journal and lock live. `--state` / `ONEMODEL_STATE` wins; else
+    /// [`platform::default_state_dir`].
     pub fn state_dir(&self) -> PathBuf {
-        if let Some(dir) = &self.state {
-            return dir.clone();
-        }
-        if cfg!(target_os = "macos") {
-            return self.home.join("Library/Application Support/onemodel");
-        }
-        match self.var("XDG_STATE_HOME") {
-            Some(dir) if Path::new(dir).is_absolute() => Path::new(dir).join("onemodel"),
-            _ => self.home.join(".local/state/onemodel"),
+        match &self.state {
+            Some(dir) => dir.clone(),
+            None => platform::default_state_dir(&self.home, self.var("XDG_STATE_HOME")),
         }
     }
 
-    /// Path of the lsof binary: `ONEMODEL_LSOF` if set, else `/usr/sbin/lsof` on macOS, else `lsof` on PATH.
+    /// Path of the lsof binary: `ONEMODEL_LSOF` if set, else [`platform::default_lsof`].
     pub fn lsof(&self) -> PathBuf {
-        match self.var("ONEMODEL_LSOF") {
-            Some(p) => PathBuf::from(p),
-            None if cfg!(target_os = "macos") => PathBuf::from("/usr/sbin/lsof"),
-            None => PathBuf::from("lsof"),
-        }
+        self.var("ONEMODEL_LSOF").map_or_else(platform::default_lsof, PathBuf::from)
     }
 
     /// `path` for human output: the home directory as `~`, and content digests in blob names
@@ -194,7 +183,7 @@ impl Env {
 
 /// Process exit codes. Refusals are not failures: a dedupe that refused some files exits 0 and says why.
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     Ok = 0,
     /// Operational error: journal unwritable, another onemodel holds the lock, bad arguments.
@@ -244,7 +233,9 @@ keeper's. Clones (the default) do not have this problem on APFS, btrfs and XFS."
 /// Every report knows its exit code and both of its renderings, so `run` stays a dispatcher.
 pub trait Report: serde::Serialize {
     fn human(&self, env: &Env) -> String;
-    fn exit(&self) -> Exit;
+    fn exit(&self) -> Exit {
+        Exit::Ok
+    }
 }
 
 fn render<R: Report>(env: &Env, json: bool, report: &R) -> anyhow::Result<Exit> {

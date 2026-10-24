@@ -227,8 +227,7 @@ impl Journal {
         let tmp = file.with_extension("jsonl.tmp");
         let ops = vec![OpState::Pending; plan.op_count() as usize];
         let rec = Record::Plan { v: FORMAT_VERSION, run: id.clone(), plan };
-        let mut line = serde_json::to_vec(&rec)?;
-        line.push(b'\n');
+        let line = record_line(&rec)?;
         {
             let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(&line)?;
@@ -238,7 +237,7 @@ impl Journal {
             bail!("run file {} already exists", file.display());
         }
         fs::rename(&tmp, &file)?;
-        platform::fsync_dir(&self.runs_dir())?;
+        platform::fsync(&self.runs_dir())?;
         let Record::Plan { plan, .. } = rec else { unreachable!() };
         let log = RunLog { id, plan, ops, ended: false, file, valid_len: line.len() as u64 };
         let writer = self.reopen(&log)?;
@@ -264,12 +263,18 @@ impl RunWriter {
     /// Serialize, append one line, `sync_all`. Returns only once the record is durable.
     /// An error here aborts the command: we must never act on a record we could not persist.
     pub fn append(&mut self, rec: &Record) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(rec)?;
-        line.push(b'\n');
+        let line = record_line(rec)?;
         self.file.write_all(&line).context("cannot write the journal")?;
         self.file.sync_all().context("cannot fsync the journal")?;
         Ok(())
     }
+}
+
+/// One journal line: the record's JSON and its newline.
+fn record_line(rec: &Record) -> anyhow::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(rec)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 /// Fold one run file's records into op states. Illegal transitions are errors.
@@ -389,7 +394,7 @@ pub enum CrashPoint {
 
 pub fn crash_point(p: CrashPoint) {
     static TARGET: OnceLock<Option<(CrashPoint, u32)>> = OnceLock::new();
-    static HITS: [AtomicU32; 11] = [const { AtomicU32::new(0) }; 11];
+    static HITS: AtomicU32 = AtomicU32::new(0);
     let target = TARGET.get_or_init(|| {
         let raw = std::env::var("ONEMODEL_CRASH_AT").ok().filter(|v| !v.is_empty())?;
         let parsed = raw.split_once(':').and_then(|(name, n)| {
@@ -403,7 +408,7 @@ pub fn crash_point(p: CrashPoint) {
     });
     if let Some((point, n)) = *target
         && point == p
-        && HITS[p as usize].fetch_add(1, Ordering::SeqCst) + 1 == n
+        && HITS.fetch_add(1, Ordering::SeqCst) + 1 == n
     {
         platform::sigkill_self();
     }

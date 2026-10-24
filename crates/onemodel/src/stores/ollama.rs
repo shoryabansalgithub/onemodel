@@ -49,7 +49,12 @@ impl StoreKind for Ollama {
         for entry in walkdir::WalkDir::new(&manifests).follow_links(false).sort_by_file_name() {
             let entry = match entry {
                 Ok(e) => e,
-                Err(e) if e.path() == Some(manifests.as_path()) && e.io_error().is_some_and(is_not_found) => break,
+                Err(e)
+                    if e.path() == Some(manifests.as_path())
+                        && e.io_error().is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+                {
+                    break;
+                }
                 Err(e) => return Err(io::Error::other(e)),
             };
             if !entry.file_type().is_file() || entry.file_name().to_string_lossy().starts_with('.') {
@@ -71,10 +76,6 @@ impl StoreKind for Ollama {
         }
         Ok(out)
     }
-}
-
-fn is_not_found(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::NotFound
 }
 
 #[derive(Deserialize)]

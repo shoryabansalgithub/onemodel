@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Entry, PARTIAL_SUFFIXES, StoreKind};
+use super::{Entry, StoreKind, is_partial};
 use crate::Env;
 
 pub struct UserPaths;
@@ -20,7 +20,6 @@ impl StoreKind for UserPaths {
     }
 
     fn classify(&self, rel: &Path) -> Entry {
-        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if PARTIAL_SUFFIXES.iter().any(|s| name.ends_with(s)) { Entry::Ignore } else { Entry::Candidate }
+        if is_partial(rel) { Entry::Ignore } else { Entry::Candidate }
     }
 }

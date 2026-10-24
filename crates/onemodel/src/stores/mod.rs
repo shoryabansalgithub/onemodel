@@ -36,7 +36,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::Env;
-use crate::matching::Fingerprint;
+use crate::matching::{self, Fingerprint};
 
 /// What one app's model store knows about itself.
 ///
@@ -72,11 +72,72 @@ pub enum Claim {
     LinkResolves { link: PathBuf },
 }
 
+/// Why a [`Claim`] does not hold. `verify` turns it into a report problem.
+#[derive(Debug)]
+pub enum ClaimBroken {
+    Missing,
+    SizeMismatch { expected: u64, actual: u64 },
+    DigestMismatch,
+    Unreadable(io::Error),
+    LinkBroken,
+}
+
+impl Claim {
+    /// The path the claim is about: the regular file, or the symlink.
+    pub fn path(&self) -> &Path {
+        match self {
+            Claim::Regular { path, .. } => path,
+            Claim::LinkResolves { link } => link,
+        }
+    }
+
+    /// Check the claim against the disk. A `Regular` claim's sha256 is read only when `hash_it`
+    /// says so, because it costs a full read of the file.
+    pub fn check(&self, hash_it: impl FnOnce(&Path) -> bool) -> Result<(), ClaimBroken> {
+        match self {
+            Claim::LinkResolves { link } => {
+                let resolves = std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+                    && std::fs::metadata(link).is_ok_and(|m| m.is_file());
+                if resolves { Ok(()) } else { Err(ClaimBroken::LinkBroken) }
+            }
+            Claim::Regular { path, size, sha256 } => {
+                let meta = match std::fs::symlink_metadata(path) {
+                    Ok(m) if m.is_file() => m,
+                    _ => return Err(ClaimBroken::Missing),
+                };
+                if meta.len() != *size {
+                    return Err(ClaimBroken::SizeMismatch { expected: *size, actual: meta.len() });
+                }
+                if !hash_it(path) {
+                    return Ok(());
+                }
+                match sha256_file(path) {
+                    Ok(actual) if actual == *sha256 => Ok(()),
+                    Ok(_) => Err(ClaimBroken::DigestMismatch),
+                    Err(e) => Err(ClaimBroken::Unreadable(e)),
+                }
+            }
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    matching::read_chunks(path, |chunk| hasher.update(chunk))?;
+    Ok(hasher.finalize().into())
+}
+
 /// The default for stores without their own naming rules: a known partial-download suffix means
 /// the app is downloading; any other file is a candidate.
 pub fn generic_classify(rel: &Path) -> Entry {
+    if is_partial(rel) { Entry::InProgress } else { Entry::Candidate }
+}
+
+/// The file name ends in a known partial-download suffix.
+pub fn is_partial(rel: &Path) -> bool {
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if PARTIAL_SUFFIXES.iter().any(|s| name.ends_with(s)) { Entry::InProgress } else { Entry::Candidate }
+    PARTIAL_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// The verdict on one regular file in a store.
@@ -213,7 +274,7 @@ fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, PathBuf, Metadata)> + '_ 
 
 /// Suffixes that mean "a download is still being written" across apps whose exact convention is
 /// unknown (LM Studio) or shared (HF `.incomplete`, llama.cpp `.downloadInProgress`).
-pub const PARTIAL_SUFFIXES: &[&str] =
+const PARTIAL_SUFFIXES: &[&str] =
     &[".part", ".partial", ".download", ".incomplete", ".tmp", ".downloadInProgress", ".crdownload"];
 
 /// Prefix of onemodel's own temp files (see `replace::temp_path`). Ignored by every walk.

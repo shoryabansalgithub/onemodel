@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::huggingface::{hub_classify, snapshot_links};
 use super::{Claim, Entry, StoreKind};
-use crate::Env;
+use crate::{Env, platform};
 
 pub struct LlamaCpp;
 
@@ -21,11 +21,7 @@ impl StoreKind for LlamaCpp {
         if let Some(dir) = env.var("LLAMA_CACHE") {
             return vec![PathBuf::from(dir)];
         }
-        if cfg!(target_os = "macos") {
-            vec![env.home.join("Library/Caches/llama.cpp")]
-        } else {
-            vec![env.home.join(".cache/llama.cpp")]
-        }
+        vec![platform::user_cache_dir(&env.home).join("llama.cpp")]
     }
 
     fn classify(&self, rel: &Path) -> Entry {

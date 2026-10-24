@@ -68,20 +68,23 @@ pub fn clone_file(src: &Path, dst: &Path) -> Result<(), CloneError> {
     }
 }
 
-/// Facts about the volume holding `path`.
-pub struct VolumeInfo {
+/// Facts about the volume holding `path`. Persisted in the plan, so field names are journal format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Volume {
     pub dev: u64,
     /// macOS: statfs `f_mntonname`. Linux: found by walking parents until `st_dev` changes.
     pub mount: PathBuf,
     /// macOS: statfs `f_fstypename` ("apfs", "hfs"). Linux: name for the statfs `f_type` magic.
     pub fs_type: String,
-    /// apfs; btrfs; xfs (reflink may still be off: the clone call decides).
+    /// apfs; btrfs; xfs. A statfs-level belief: the clone call itself is the final word
+    /// (ENOTSUP -> NoCloneSupport), and xfs reflink may still be off.
     pub clones: bool,
-    /// What an unprivileged writer can actually use.
+    /// [`free_bytes`] when measured. In a plan that is plan time, hence the journal name.
+    #[serde(rename = "free_before")]
     pub free: u64,
 }
 
-pub fn volume(path: &Path) -> io::Result<VolumeInfo> {
+pub fn volume(path: &Path) -> io::Result<Volume> {
     let dev = fs::symlink_metadata(path)?.dev();
     #[cfg(target_os = "macos")]
     {
@@ -96,7 +99,7 @@ pub fn volume(path: &Path) -> io::Result<VolumeInfo> {
             )
         };
         let clones = fs_type == "apfs";
-        Ok(VolumeInfo { dev, mount, fs_type, clones, free: st.f_bavail * u64::from(st.f_bsize) })
+        Ok(Volume { dev, mount, fs_type, clones, free: free_bytes(path)? })
     }
     #[cfg(target_os = "linux")]
     {
@@ -116,7 +119,7 @@ pub fn volume(path: &Path) -> io::Result<VolumeInfo> {
             }
             mount = parent.to_path_buf();
         }
-        Ok(VolumeInfo { dev, mount, fs_type, clones, free: free_bytes(path)? })
+        Ok(Volume { dev, mount, fs_type, clones, free: free_bytes(path)? })
     }
 }
 
@@ -229,14 +232,10 @@ pub fn real_copy(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// fsync (F_FULLFSYNC on macOS, via std).
-pub fn fsync_file(path: &Path) -> io::Result<()> {
+/// fsync a file, or a directory so a rename or create inside it is durable (F_FULLFSYNC on macOS,
+/// via std).
+pub fn fsync(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
-}
-
-/// fsync a directory so a rename or create inside it is durable.
-pub fn fsync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
 }
 
 /// True if the file itself (not a symlink target) carries an extended ACL. clonefile would give the
@@ -349,6 +348,47 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     }
     let e = io::Error::last_os_error();
     if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
+}
+
+/// Where the journal lives without `--state`: macOS `~/Library/Application Support/onemodel`,
+/// Linux `$XDG_STATE_HOME/onemodel` (when absolute) or `~/.local/state/onemodel`.
+pub fn default_state_dir(home: &Path, xdg_state_home: Option<&str>) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = xdg_state_home;
+        home.join("Library/Application Support/onemodel")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match xdg_state_home {
+            Some(dir) if Path::new(dir).is_absolute() => Path::new(dir).join("onemodel"),
+            _ => home.join(".local/state/onemodel"),
+        }
+    }
+}
+
+/// The per-user cache directory: macOS `~/Library/Caches`, Linux `~/.cache`.
+pub fn user_cache_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Caches")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home.join(".cache")
+    }
+}
+
+/// The lsof to run when `ONEMODEL_LSOF` is unset: `/usr/sbin/lsof` on macOS, `lsof` on PATH on Linux.
+pub fn default_lsof() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/usr/sbin/lsof")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("lsof")
+    }
 }
 
 pub fn euid() -> u32 {
