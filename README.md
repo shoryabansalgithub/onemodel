@@ -74,3 +74,22 @@ Options that work with every command:
 | llama.cpp | `$LLAMA_CACHE`, else `~/Library/Caches/llama.cpp` (macOS) or `~/.cache/llama.cpp` (Linux) |
 
 A new store is one file in `crates/onemodel/src/stores/` plus one line in the registry in `stores/mod.rs`.
+
+## Measured results
+
+All numbers come from one MacBook (Apple silicon, APFS, warm page cache), measured on 2026-10-24. Freed space is the change in free space that `statfs` reports, because APFS clones do not show up in `du`.
+
+| Setup | Stores | Duplicates found | Reclaimed | `scan` | `dedupe` | `undo` |
+| --- | --- | --- | --- | --- | --- | --- |
+| SmolLM2-360M Q4_K_M (270.6 MB) installed by Ollama, Hugging Face, LM Studio and llama.cpp | 4 | 3 | 0.81 GB | 0.43 s | 1.11 s | 0.82 s |
+| Qwen2.5-3B Q4_K_M (1.93 GB), two copies in two `--path` folders | 2 | 1 | 1.93 GB | 2.47 s | 3.57 s | 1.75 s |
+
+After the first row's dedupe, `ollama run` on both Ollama model names and `llama-completion` on the LM Studio, Hugging Face and llama.cpp paths each loaded the shared file and answered "Paris" to "The capital of France is", with temperature 0. They gave the same answer again after `undo`.
+
+## Which apps really store the same bytes
+
+`onemodel` only helps when two apps hold byte-identical files. On this Mac:
+
+- `ollama pull hf.co/<user>/<repo>:<quant>` and `ollama create` from a local GGUF both store the GGUF unchanged. The blob name is the file's SHA-256, the same value Hugging Face lists for the file. These match LM Studio, llama.cpp and Hugging Face downloads of the same file.
+- Ollama library models (`ollama pull qwen2.5:3b`) are packaged by Ollama. The `qwen2.5:3b` weights blob matched neither the official Qwen GGUF nor the bartowski GGUF of the same quantization. That is one sample, but do not count on library models matching anything.
+- llama.cpp b11850 downloads `-hf` models into the Hugging Face cache, so by default it already shares files with Hugging Face. With `LLAMA_CACHE` set, it writes a separate copy in the same layout, and `onemodel` dedupes that copy.
