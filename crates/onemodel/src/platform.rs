@@ -19,9 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub enum CloneError {
     /// The filesystem cannot clone (ENOTSUP, EOPNOTSUPP, EXDEV, EINVAL from FICLONE on ext4/tmpfs).
-    Unsupported {
-        errno_name: &'static str,
-    },
+    Unsupported,
     Io(io::Error),
 }
 
@@ -31,11 +29,9 @@ fn c_path(path: &Path) -> io::Result<CString> {
 
 fn clone_error(e: io::Error) -> CloneError {
     match e.raw_os_error() {
-        Some(libc::ENOTSUP) => CloneError::Unsupported { errno_name: "ENOTSUP" },
-        Some(libc::EOPNOTSUPP) => CloneError::Unsupported { errno_name: "EOPNOTSUPP" },
-        Some(libc::EXDEV) => CloneError::Unsupported { errno_name: "EXDEV" },
+        Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV) => CloneError::Unsupported,
         #[cfg(target_os = "linux")]
-        Some(libc::EINVAL) => CloneError::Unsupported { errno_name: "EINVAL" },
+        Some(libc::EINVAL) => CloneError::Unsupported,
         _ => CloneError::Io(e),
     }
 }
