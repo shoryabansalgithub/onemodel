@@ -13,9 +13,6 @@
 //! | `replace`   | the one atomic file swap, its crash recovery, and its inverse (rematerialize) |
 //! | `platform`  | every OS call that differs between macOS and Linux; the only `unsafe`         |
 
-// Sketch only: bodies are todo!(), so most items are not yet reachable.
-#![allow(dead_code)]
-
 mod commands;
 mod journal;
 mod matching;
