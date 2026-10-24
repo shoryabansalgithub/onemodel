@@ -93,3 +93,23 @@ After the first row's dedupe, `ollama run` on both Ollama model names and `llama
 - `ollama pull hf.co/<user>/<repo>:<quant>` and `ollama create` from a local GGUF both store the GGUF unchanged. The blob name is the file's SHA-256, the same value Hugging Face lists for the file. These match LM Studio, llama.cpp and Hugging Face downloads of the same file.
 - Ollama library models (`ollama pull qwen2.5:3b`) are packaged by Ollama. The `qwen2.5:3b` weights blob matched neither the official Qwen GGUF nor the bartowski GGUF of the same quantization. That is one sample, but do not count on library models matching anything.
 - llama.cpp b11850 downloads `-hf` models into the Hugging Face cache, so by default it already shares files with Hugging Face. With `LLAMA_CACHE` set, it writes a separate copy in the same layout, and `onemodel` dedupes that copy.
+
+## Safety guarantees
+
+- **Bytes, not hashes, decide.** Files are grouped by size, then a BLAKE3 hash of three samples, then a full BLAKE3 hash. Just before the swap, `onemodel` compares the prepared clone with the target byte for byte. The bytes it checks are the bytes it installs.
+- **The swap is atomic.** The keeper is cloned (`clonefile` on macOS) to a temporary file in the target's own directory. That file gets the target's mode, mtime and extended attributes, is fsynced, and is renamed over the target. The directory is fsynced after the rename.
+- **Every step is journaled first.** The plan is written to the journal before any file changes, and a fsynced record precedes each rename. If `dedupe` is killed at any point, the next `dedupe` finishes the same plan, and the next `undo` can unwind it instead. The test suite sends SIGKILL at all 11 crash points for every file in a five-store fixture, 100 cases in all. Each resumed run must end with the same files, metadata and journal as an uninterrupted run.
+- **It refuses rather than guesses, and says why.** It skips a file that `lsof` shows open or mapped by any process. It skips every store whose app has a download in progress (`*-partial` Ollama blobs, `*.incomplete`, `*.downloadInProgress`, `.part` files). It also skips files on a different volume from their match, filesystems without clones, files with other hard links, files owned by another user, files with an ACL, and files that changed since the scan. If `lsof` cannot run, nothing is touched.
+- **Hugging Face links stay intact.** Only regular files are candidates. Snapshot symlinks are never followed or replaced, and `verify` checks that each one still resolves.
+- **Undo copies from the file as it is now.** If an app wrote to a clone after the dedupe, undo keeps the app's bytes. It checks for free space first.
+- **Hard links are opt-in.** `dedupe --hardlink` exists for filesystems without clones. It prints a warning, because with hard links a write through one path changes every path.
+
+## Limits
+
+- `onemodel` knows a file is shared only because its own journal says so. It cannot see clones made by other tools, so it may suggest cloning a file that already shares its blocks.
+- `scan` and `dedupe` re-hash every file in a size group on each run, which took about 0.65 seconds per GB here with a warm page cache. There is no hash cache.
+- The open-file check uses `lsof`. A process that opens the file after the check and before the rename is not caught. Run `dedupe` while your model apps are idle.
+- The Linux path (FICLONE, statfs magic numbers, `lsof` from `PATH`) is written but has never run. Minimal Linux systems without `lsof` refuse every file.
+- `--hardlink` does not keep per-path extended attributes, and undo restores only mode and mtime in that mode.
+- LM Studio support is based on its documented folder layout. LM Studio itself was not installed on the test machine.
+- Only one `onemodel` runs at a time. A second one exits with an error.
