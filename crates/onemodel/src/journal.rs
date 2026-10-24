@@ -21,6 +21,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -386,7 +388,23 @@ pub enum CrashPoint {
 }
 
 pub fn crash_point(p: CrashPoint) {
-    // TODO: OnceLock<Option<(CrashPoint, u32)>> parsed from env; static AtomicU32 hit counters per point;
-    //       on match: platform::sigkill_self().
-    let _ = p;
+    static TARGET: OnceLock<Option<(CrashPoint, u32)>> = OnceLock::new();
+    static HITS: [AtomicU32; 11] = [const { AtomicU32::new(0) }; 11];
+    let target = TARGET.get_or_init(|| {
+        let raw = std::env::var("ONEMODEL_CRASH_AT").ok().filter(|v| !v.is_empty())?;
+        let parsed = raw.split_once(':').and_then(|(name, n)| {
+            Some((<CrashPoint as clap::ValueEnum>::from_str(name, false).ok()?, n.parse::<u32>().ok()?))
+        });
+        if parsed.is_none() {
+            eprintln!("onemodel: ONEMODEL_CRASH_AT={raw:?} is not <point>:<n>");
+            std::process::exit(1);
+        }
+        parsed
+    });
+    if let Some((point, n)) = *target
+        && point == p
+        && HITS[p as usize].fetch_add(1, Ordering::SeqCst) + 1 == n
+    {
+        platform::sigkill_self();
+    }
 }
