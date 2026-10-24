@@ -6,14 +6,16 @@
 //! uninterrupted run. Every op still revalidates its target at execution time, so a stale plan can
 //! only produce refusals, never a wrong replacement.
 
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::journal::Managed;
-use crate::matching::{Fingerprint, Hash, Matches, Unreadable};
-use crate::platform::Holder;
+use crate::matching::{FileId, Fingerprint, Hash, Matches, Unreadable};
+use crate::platform::{self, Holder};
 use crate::stores::{Inventory, Store, StoreIx};
 use crate::{Env, fmt_bytes};
 
@@ -62,6 +64,7 @@ pub struct Member {
     pub also: Vec<PathBuf>,
     pub store: StoreIx,
     pub stat: Fingerprint,
+    #[serde(flatten)]
     pub role: Role,
 }
 
@@ -69,7 +72,7 @@ pub struct Member {
 /// - each (group, volume) has at most one `Keeper`;
 /// - every `Target { keeper }` names a `Keeper` member of the same group on the same `dev`;
 /// - `Target.op` values across the plan are exactly `0..n`, increasing in (group, member) order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Role {
     Keeper,
@@ -77,8 +80,8 @@ pub enum Role {
         op: u32,
         keeper: u16,
     },
-    /// Already a clone of this volume's keeper made by an earlier run (journal says so and the
-    /// inode still matches). Not counted as reclaimable.
+    /// Already a clone made by an earlier run (journal says so and the inode still matches).
+    /// Not counted as reclaimable.
     Shared,
     Refused {
         refusal: Refusal,
@@ -191,40 +194,177 @@ impl Plan {
     pub fn reclaimable(&self) -> u64 {
         self.ops().map(|op| op.size).sum()
     }
+
+    pub fn volume(&self, dev: u64) -> Option<&Volume> {
+        self.volumes.iter().find(|v| v.dev == dev)
+    }
 }
 
-/// Build the plan: gather facts with I/O (volumes via statfs, open holders via one batched lsof
-/// over every would-be target), then decide purely in `decide`.
+/// Build the plan: gather facts with I/O (volumes via statfs, ACLs, open holders via one batched
+/// lsof over every member), then decide purely in `decide`.
 ///
 /// `managed` (from the journal) makes repeated runs idempotent: existing clones become `Shared`
 /// and their keeper stays the keeper.
 pub fn make_plan(env: &Env, inv: Inventory, matches: Matches, mode: Mode, managed: &[Managed]) -> anyhow::Result<Plan> {
-    let _ = (env, inv, matches, mode, managed);
-    todo!()
+    let mut volumes: Vec<Volume> = Vec::new();
+    let mut acl = BTreeSet::new();
+    let mut paths: Vec<&Path> = Vec::new();
+    for g in &matches.groups {
+        for inode in &g.inodes {
+            let path = &inode.paths[0].0;
+            if !volumes.iter().any(|v| v.dev == inode.stat.id.dev) {
+                let info = platform::volume(path)?;
+                volumes.push(Volume {
+                    dev: info.dev,
+                    mount: info.mount,
+                    fs_type: info.fs_type,
+                    clones: info.clones,
+                    free_before: info.free,
+                });
+            }
+            if platform::has_acl(path).unwrap_or(false) {
+                acl.insert(path.clone());
+            }
+            paths.push(path);
+        }
+    }
+    let holders = platform::open_holders(&env.lsof(), &paths);
+    let facts = Facts { inv: &inv, volumes: &volumes, holders: &holders, acl: &acl, euid: platform::euid(), managed };
+    let groups = decide(&facts, matches.groups, mode);
+    let plan = Plan { mode, stores: inv.stores.clone(), volumes, groups, unreadable: matches.unreadable };
+    debug_assert_plan(&plan);
+    Ok(plan)
 }
 
 /// Facts `make_plan` gathers with I/O before deciding.
-#[allow(dead_code)]
 struct Facts<'a> {
     inv: &'a Inventory,
     volumes: &'a [Volume],
-    holders: &'a Result<std::collections::BTreeMap<PathBuf, Vec<Holder>>, String>,
+    holders: &'a Result<BTreeMap<PathBuf, Vec<Holder>>, String>,
+    acl: &'a BTreeSet<PathBuf>,
     euid: u32,
     managed: &'a [Managed],
 }
 
 /// Pure decision, in this order per group:
-/// 1. members in a downloading store -> Refused(StoreDownloading). They are neither keeper nor target.
+/// 1. members in a downloading store -> Refused(StoreDownloading); members with an extended ACL ->
+///    Refused(HasAcl). They are neither keeper nor target.
 /// 2. split remaining members by `stat.id.dev`.
-/// 3. per volume: keeper = the inode that is already a managed keeper, else the inode with most
-///    paths, else smallest path. Deterministic for a given machine state.
-/// 4. volume with exactly one eligible member and another volume holding the content ->
-///    Refused(DifferentVolume). Volume with `clones == false` in Clone mode -> Refused(NoCloneSupport).
-/// 5. per non-keeper member: managed clone of this keeper -> Shared; nlink > 1 -> MultiplyLinked;
-///    uid != our euid -> ForeignOwner; open per lsof -> OpenByProcess / OpenCheckFailed;
-///    else Target with the next op index.
-#[allow(dead_code)]
-fn decide(facts: &Facts<'_>, matches: Matches, mode: Mode) -> Plan {
-    let _ = (facts, matches, mode);
-    todo!()
+/// 3. per volume: keeper = the inode that is already a managed keeper, else a managed clone (the
+///    original was replaced, so a re-downloaded original costs one op, not N), else the inode with
+///    most links, else smallest path. Deterministic for a given machine state.
+/// 4. the volume holding the most members is the group's home; a member alone on any other volume
+///    -> Refused(DifferentVolume).
+/// 5. per non-keeper member: managed clone -> Shared; volume without clones in Clone mode ->
+///    NoCloneSupport; nlink > 1 -> MultiplyLinked; uid != our euid -> ForeignOwner; open per lsof
+///    -> OpenByProcess / OpenCheckFailed; else Target with the next op index.
+fn decide(facts: &Facts<'_>, groups: Vec<crate::matching::DupGroup>, mode: Mode) -> Vec<GroupPlan> {
+    let managed_keepers: BTreeSet<(FileId, Hash)> = facts.managed.iter().map(|m| (m.keeper_id, m.hash)).collect();
+    let managed_targets: BTreeSet<(FileId, Hash)> = facts.managed.iter().map(|m| (m.ino, m.hash)).collect();
+    let mut next_op = 0u32;
+    let mut out = Vec::new();
+    for g in groups {
+        let mut roles: Vec<Option<Role>> = vec![None; g.inodes.len()];
+        for (ix, inode) in g.inodes.iter().enumerate() {
+            let downloading = inode.paths.iter().find_map(|(_, s)| {
+                let store = &facts.inv.stores[s.0 as usize];
+                store.downloading.as_ref().map(|m| (store.kind.clone(), m.clone()))
+            });
+            if let Some((store, marker)) = downloading {
+                roles[ix] = Some(Role::Refused { refusal: Refusal::StoreDownloading { store, marker } });
+            } else if facts.acl.contains(&inode.paths[0].0) {
+                roles[ix] = Some(Role::Refused { refusal: Refusal::HasAcl });
+            }
+        }
+        let mut by_dev: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (ix, inode) in g.inodes.iter().enumerate().filter(|(ix, _)| roles[*ix].is_none()) {
+            by_dev.entry(inode.stat.id.dev).or_default().push(ix);
+        }
+        let is_managed_keeper = |ix: usize| managed_keepers.contains(&(g.inodes[ix].stat.id, g.hash));
+        let is_managed_target = |ix: usize| managed_targets.contains(&(g.inodes[ix].stat.id, g.hash));
+        let keeper_of = |ixs: &[usize]| {
+            *ixs.iter()
+                .min_by_key(|&&ix| {
+                    let i = &g.inodes[ix];
+                    (
+                        Reverse(is_managed_keeper(ix)),
+                        Reverse(is_managed_target(ix)),
+                        Reverse(i.stat.nlink),
+                        &i.paths[0].0,
+                    )
+                })
+                .expect("partitions are non-empty")
+        };
+        let home =
+            by_dev.iter().max_by_key(|(_, ixs)| (ixs.len(), Reverse(ixs[0]))).map(|(dev, ixs)| (*dev, keeper_of(ixs)));
+        for (dev, ixs) in &by_dev {
+            let keeper = keeper_of(ixs);
+            let vol = facts.volumes.iter().find(|v| v.dev == *dev).expect("every member's volume was measured");
+            match home {
+                Some((home_dev, home_keeper)) if ixs.len() == 1 && *dev != home_dev => {
+                    let keeper_mount = facts
+                        .volumes
+                        .iter()
+                        .find(|v| v.dev == g.inodes[home_keeper].stat.id.dev)
+                        .map_or_else(PathBuf::new, |v| v.mount.clone());
+                    roles[keeper] = Some(Role::Refused { refusal: Refusal::DifferentVolume { keeper_mount } });
+                    continue;
+                }
+                _ => roles[keeper] = Some(Role::Keeper),
+            }
+            for &ix in ixs.iter().filter(|&&ix| ix != keeper) {
+                let inode = &g.inodes[ix];
+                let path = &inode.paths[0].0;
+                let refusal = if is_managed_target(ix) {
+                    roles[ix] = Some(Role::Shared);
+                    continue;
+                } else if mode == Mode::Clone && !vol.clones {
+                    Refusal::NoCloneSupport { fs_type: vol.fs_type.clone() }
+                } else if inode.stat.nlink > 1 {
+                    Refusal::MultiplyLinked { nlink: inode.stat.nlink }
+                } else if inode.stat.uid != facts.euid {
+                    Refusal::ForeignOwner { uid: inode.stat.uid }
+                } else {
+                    match facts.holders {
+                        Err(detail) => Refusal::OpenCheckFailed { detail: detail.clone() },
+                        Ok(open) => match open.get(path) {
+                            Some(holders) => Refusal::OpenByProcess { holders: holders.clone() },
+                            None => {
+                                roles[ix] = Some(Role::Target { op: 0, keeper: keeper as u16 });
+                                continue;
+                            }
+                        },
+                    }
+                };
+                roles[ix] = Some(Role::Refused { refusal });
+            }
+        }
+        let members = g
+            .inodes
+            .into_iter()
+            .zip(roles)
+            .map(|(inode, role)| {
+                let mut role = role.expect("every member gets a role");
+                if let Role::Target { op, .. } = &mut role {
+                    *op = next_op;
+                    next_op += 1;
+                }
+                let mut paths = inode.paths.into_iter();
+                let (path, store) = paths.next().expect("an inode has at least one path");
+                Member { path, also: paths.map(|(p, _)| p).collect(), store, stat: inode.stat, role }
+            })
+            .collect();
+        out.push(GroupPlan { hash: g.hash, size: g.size, members });
+    }
+    out
+}
+
+fn debug_assert_plan(plan: &Plan) {
+    if cfg!(debug_assertions) {
+        for (expected, op) in plan.ops().enumerate() {
+            assert_eq!(op.ix as usize, expected, "op indices are 0..n in (group, member) order");
+            assert_eq!(op.keeper.role, Role::Keeper, "every target names a keeper");
+            assert_eq!(op.keeper.stat.id.dev, op.target.stat.id.dev, "keeper and target share a volume");
+        }
+    }
 }
