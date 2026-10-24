@@ -25,13 +25,47 @@ use crate::matching::{FileId, Hash};
 use crate::plan::{Plan, Refusal};
 
 /// `<unix-seconds>-<pid>`: sortable by start time, unique per machine (one onemodel at a time).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunId(pub String);
+
+impl RunId {
+    fn new() -> RunId {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        RunId(format!("{secs}-{}", std::process::id()))
+    }
+
+    fn key(&self) -> (u64, u64) {
+        let (a, b) = self.0.split_once('-').unwrap_or(("0", "0"));
+        (a.parse().unwrap_or(0), b.parse().unwrap_or(0))
+    }
+}
+
+impl Ord for RunId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key()).then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for RunId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 impl std::str::FromStr for RunId {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        todo!("{s}: validate <digits>-<digits>")
+        let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+        match s.split_once('-') {
+            Some((a, b)) if digits(a) && digits(b) => Ok(RunId(s.to_string())),
+            _ => Err(format!("{s:?} is not a run id (expected <digits>-<digits>, as listed by `onemodel scan`)")),
+        }
     }
 }
 
