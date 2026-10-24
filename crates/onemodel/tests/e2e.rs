@@ -1,16 +1,3 @@
-//! End-to-end suite: every test runs the built binary against a fixture HOME in a tempdir, with
-//! `env_clear()` plus PATH, HOME and every store variable pointing inside the fixture, and the
-//! journal in a fixture `--state`. No test can see or touch a real model store. Assertions are on
-//! what a user observes: files on disk (bytes, mode, mtime, xattrs, symlinks, inode sharing),
-//! statfs free space, exit codes, and the `--json` reports.
-//!
-//! Platform seams, and nothing else:
-//! - clones: the host filesystem. macOS tempdirs are APFS. On Linux, clone tests need
-//!   `ONEMODEL_TEST_BTRFS=<dir on btrfs or xfs>` and say why they skipped otherwise.
-//! - extra volumes: macOS `hdiutil` images attached at a fixture mountpoint, detached on drop.
-//! - lsof: the real one, against a real child process; `ONEMODEL_LSOF` for "lsof cannot run".
-//! - crash: `ONEMODEL_CRASH_AT=<point>:<n>`, a real SIGKILL the binary sends itself.
-
 use std::collections::BTreeMap;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -24,7 +11,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 const MIB: usize = 1 << 20;
-/// Bigger than the 3 MiB sampled-hash window, so a byte at 1.25 MiB is outside every sample.
 const SIZE: usize = 4 * MIB;
 const XATTR: &str = "user.onemodel.test";
 
@@ -34,7 +20,6 @@ fn content(seed: &str) -> Vec<u8> {
     out
 }
 
-/// sha256 hex of contents A, B and C: the names Ollama and the hub give those blobs.
 fn digests() -> &'static [String; 3] {
     static D: OnceLock<[String; 3]> = OnceLock::new();
     D.get_or_init(|| ["A", "B", "C"].map(|s| sha256_hex(&content(s))))
@@ -87,7 +72,6 @@ struct Fixture {
     extra_args: Vec<String>,
 }
 
-/// Relative paths of the standard fixture, under HOME.
 const OLLAMA_A: &str = ".ollama/models/blobs/sha256-A";
 const OLLAMA_B: &str = ".ollama/models/blobs/sha256-B";
 const LM_A: &str = ".lmstudio/models/pub/repo/a.gguf";
@@ -108,11 +92,6 @@ impl Fixture {
         Some(Fixture { _tmp: tmp, state: root.join("state"), root, home, extra, extra_args: Vec::new() })
     }
 
-    /// A machine with five stores. Content A is in four stores, B in three, C in two; D and E are
-    /// near-copies of A (D differs in the first byte, E only at 1.25 MiB, outside every sample);
-    /// F is one inode with two hardlinked names. A hub `.lock` file holds C's bytes but is never a
-    /// candidate. Every file has its own mode, mtime and xattr.
-    /// An uninterrupted `dedupe` makes exactly six replacements.
     fn new() -> Option<Fixture> {
         let fx = Fixture::empty()?;
         let (a, b, c) = (content("A"), content("B"), content("C"));
@@ -166,7 +145,6 @@ impl Fixture {
         Some(fx)
     }
 
-    /// The on-disk path of a fixture name (content-addressed names get their real digests).
     fn path(&self, rel: &str) -> PathBuf {
         let [sa, sb, sc] = digests();
         self.home.join(
@@ -178,7 +156,6 @@ impl Fixture {
         )
     }
 
-    /// Inverse of `path`: a reported absolute path back to its fixture name.
     fn name(&self, abs: &str) -> String {
         let [sa, sb, sc] = digests();
         let rel = abs.strip_prefix(&format!("{}/", self.home.display())).unwrap_or(abs);
@@ -216,7 +193,6 @@ impl Fixture {
         self.command(args, env).output().unwrap()
     }
 
-    /// Run with `--json`, require `code`, parse stdout.
     fn json_code(&self, args: &[&str], code: i32) -> Value {
         let out = self.run(&[&["--json"], args].concat());
         assert_eq!(out.status.code(), Some(code), "{args:?}\n{}", text(&out));
@@ -234,7 +210,6 @@ impl Fixture {
         }
     }
 
-    /// `(target, outcome or refusal reason)` for every op in a dedupe or undo report, sorted.
     fn outcomes(&self, report: &Value) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = report["results"]
             .as_array()
@@ -252,7 +227,6 @@ impl Fixture {
         out
     }
 
-    /// `(path, role or refusal reason)` for every member of every group in a plan, sorted.
     fn roles(&self, groups: &Value) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = groups
             .as_array()
@@ -287,9 +261,6 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
     out
 }
 
-/// Everything a user can observe about HOME, independent of inode numbers: per path its kind,
-/// content hash, mode, mtime, xattrs or symlink target, then which paths share an inode.
-/// onemodel temp files show up as paths, so a leftover temp makes two snapshots differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Disk(Vec<String>);
 
@@ -348,7 +319,6 @@ fn same_inode(fx: &Fixture, a: &str, b: &str) -> bool {
     (ma.dev(), ma.ino()) == (mb.dev(), mb.ino())
 }
 
-/// The six replacements an uninterrupted dedupe of the standard fixture makes.
 fn six_replaced() -> Vec<(String, String)> {
     pairs(&[
         (OLLAMA_A, "replaced"),
@@ -360,7 +330,6 @@ fn six_replaced() -> Vec<(String, String)> {
     ])
 }
 
-/// Roles in the standard fixture before any dedupe: keepers are the smallest path per group.
 fn fresh_roles() -> Vec<(String, String)> {
     pairs(&[
         (LM_A, "keeper"),
@@ -419,8 +388,6 @@ fn dry_run_matches_real_run_and_changes_nothing() {
     assert_eq!(fx.outcomes(&real), planned);
 }
 
-/// Clones leave every path looking exactly as before: same bytes, mode, mtime, xattrs, symlinks.
-/// The targets do not pick up the keeper's mode or xattrs (each file has its own in the fixture).
 #[test]
 fn dedupe_replaces_targets_preserving_metadata_and_store_integrity() {
     let Some(fx) = Fixture::new() else { return };
@@ -504,8 +471,6 @@ fn verify_deep_checks_every_ollama_blob_against_its_manifest() {
     assert_eq!(fx.name(deep["problems"][0]["path"].as_str().unwrap()), OLLAMA_B);
 }
 
-/// When an app re-downloads the keeper (new inode, same bytes), one op re-shares it with an
-/// existing clone instead of re-cloning every target.
 #[test]
 fn redownloaded_keeper_costs_one_op() {
     let Some(fx) = Fixture::new() else { return };
@@ -573,8 +538,6 @@ fn statfs_free(path: &Path) -> u64 {
     st.f_bavail * st.f_bsize as u64
 }
 
-/// Undo restores bytes, mode, mtime and separate inodes. Per-path xattrs are lost in hardlink
-/// mode, which the warning says.
 #[test]
 fn hardlink_mode_warns_and_links_and_undo_unlinks() {
     let Some(fx) = Fixture::new() else { return };
@@ -596,7 +559,6 @@ fn hardlink_mode_warns_and_links_and_undo_unlinks() {
     assert_eq!(without_xattrs(&disk(&fx)), without_xattrs(&before));
 }
 
-/// A child process holding `path` open on fd 3. Killed on drop.
 struct Holder(Child);
 
 impl Holder {
@@ -680,7 +642,6 @@ fn undo_refuses_open_file_and_only_limits_scope() {
     assert_eq!(fx.roles(&fx.json(&["scan"])["groups"]), fresh_roles());
 }
 
-/// A killed undo leaves a full-size copy behind; a rerun that refuses the file must still remove it.
 #[test]
 fn undo_refused_after_a_crash_leaves_no_temp_copy() {
     let Some(fx) = Fixture::new() else { return };
@@ -787,8 +748,6 @@ fn refuses_store_mid_download() {
     }
 }
 
-/// A linked name may live outside every store, so replacing one name would split the file.
-/// A multiply linked file can still be the keeper, and is preferred as one.
 #[test]
 fn refuses_multiply_linked_target() {
     let Some(fx) = Fixture::new() else { return };
@@ -813,7 +772,6 @@ fn refuses_files_with_an_acl() {
     assert_eq!(report["results"].as_array().unwrap().len(), 5);
 }
 
-/// An attached disk image, detached on drop.
 #[cfg(target_os = "macos")]
 struct Volume {
     mount: PathBuf,
@@ -889,8 +847,6 @@ fn refuses_target_changed_after_plan() {
     assert_eq!(fs::metadata(fx.path(EXTRA_B)).unwrap().mode() & 0o777, 0o600);
 }
 
-/// Hashes said equal at plan time; the keeper was then rewritten in place. The byte compare of the
-/// prepared clone against each target catches it, so no target gets the new bytes.
 #[test]
 fn refuses_when_bytes_differ_despite_plan() {
     let Some(fx) = Fixture::new() else { return };
@@ -942,7 +898,6 @@ fn cases(points: &[(&str, u32)]) -> Vec<String> {
     points.iter().flat_map(|(p, hits)| (1..=*hits).map(move |n| format!("{p}:{n}"))).collect()
 }
 
-/// Run `case` for every crash spec on four threads; report every failing spec, not just the first.
 fn matrix(specs: Vec<String>, case: impl Fn(&str) + Sync) {
     let queue = Mutex::new(specs.clone());
     let failures = Mutex::new(Vec::new());
@@ -971,8 +926,6 @@ fn killed(fx: &Fixture, args: &[&str], spec: &str) {
     assert_eq!(out.status.signal(), Some(9), "{spec} did not kill {args:?}\n{}", text(&out));
 }
 
-/// The brief's proof: SIGKILL at every dedupe crash point for every op, rerun `dedupe`, and the
-/// machine ends exactly where an uninterrupted run leaves it; `undo` then restores the original.
 #[test]
 fn sigkill_at_every_dedupe_point_then_resume_matches_uninterrupted_run() {
     let Some(reference) = Fixture::new() else { return };
@@ -1038,8 +991,6 @@ fn sigkill_in_hardlink_mode_then_resume_matches_uninterrupted_run() {
     });
 }
 
-/// SIGKILL mid-run, then `undo` instead of resuming: the in-flight op is settled, ops that never
-/// started are never executed, finished ops are restored, and a later `dedupe` plans afresh.
 #[test]
 fn sigkill_then_undo_restores_original_state() {
     matrix(cases(&[("after-staged", 6), ("after-rename", 6)]), |spec| {
