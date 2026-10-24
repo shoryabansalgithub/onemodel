@@ -345,8 +345,14 @@ pub fn open_holders(lsof: &Path, paths: &[&Path]) -> Result<BTreeMap<PathBuf, Ve
 
 /// flock(LOCK_EX | LOCK_NB). `Ok(false)` = someone else holds it.
 pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
-    let _ = file;
-    todo!()
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the duration of the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
 }
 
 pub fn euid() -> u32 {
