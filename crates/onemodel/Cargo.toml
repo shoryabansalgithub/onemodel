@@ -16,7 +16,7 @@ anyhow = "1"
 # Content identity: partial and full hashes for grouping, and `verify`. Fast enough to be disk-bound.
 blake3 = "1"
 # CLI surface via derive; also `ValueEnum` for the crash-point names parsed from the env seam.
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 # The only way to reach clonefile(2), ioctl(FICLONE), statfs/statvfs, flock(2) and kill(SIGKILL).
 libc = "0.2"
 # Journal records and `--json` reports share one set of derives; the journal IS serialized domain types.

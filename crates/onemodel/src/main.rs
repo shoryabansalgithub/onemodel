@@ -25,9 +25,10 @@ mod replace;
 mod stores;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
 use crate::journal::RunId;
@@ -48,7 +49,11 @@ struct Cli {
     #[arg(long, value_name = "SIZE", default_value = "32M", value_parser = parse_size, global = true)]
     min_size: u64,
 
-    /// Print one JSON document on stdout instead of human text. Human warnings still go to stderr.
+    /// Keep the journal in DIR instead of the default location.
+    #[arg(long, value_name = "DIR", env = "ONEMODEL_STATE", global = true)]
+    state: Option<PathBuf>,
+
+    /// Print one JSON document on stdout instead of text. Warnings still go to stderr.
     #[arg(long, global = true)]
     json: bool,
 
@@ -91,15 +96,36 @@ enum Cmd {
 pub struct Env {
     pub home: PathBuf,
     vars: BTreeMap<String, String>,
-    /// From `--path`, canonicalized. Non-directories are rejected at parse time.
+    /// From `--path`, canonicalized. Non-directories are rejected here.
     pub user_paths: Vec<PathBuf>,
     pub min_size: u64,
+    /// From `--state` or `ONEMODEL_STATE`.
+    state: Option<PathBuf>,
 }
 
 impl Env {
     /// Invariant: `home` is absolute; `user_paths` are canonical existing directories.
-    pub fn from_process(user_paths: Vec<PathBuf>, min_size: u64) -> anyhow::Result<Env> {
-        todo!("HOME (error if unset), env::vars() snapshot, canonicalize {user_paths:?}, {min_size}")
+    pub fn from_process(user_paths: Vec<PathBuf>, min_size: u64, state: Option<PathBuf>) -> anyhow::Result<Env> {
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).context("HOME is not set")?;
+        let home = PathBuf::from(home);
+        if !home.is_absolute() {
+            bail!("HOME must be an absolute path, not {}", home.display());
+        }
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let vars =
+            std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+        let user_paths = user_paths
+            .iter()
+            .map(|p| {
+                let canonical = std::fs::canonicalize(p).with_context(|| format!("--path {}", p.display()))?;
+                if !canonical.is_dir() {
+                    bail!("--path {} is not a directory", p.display());
+                }
+                Ok(canonical)
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let state = state.map(|s| std::path::absolute(&s)).transpose().context("--state")?;
+        Ok(Env { home, vars, user_paths, min_size, state })
     }
 
     /// Non-empty value of an environment variable.
@@ -107,16 +133,38 @@ impl Env {
         self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
     }
 
-    /// Where the journal and lock live. `ONEMODEL_STATE_DIR` wins (tests and power users);
-    /// else macOS `~/Library/Application Support/onemodel`, Linux `$XDG_STATE_HOME/onemodel`
-    /// or `~/.local/state/onemodel`.
+    /// Where the journal and lock live. `--state` / `ONEMODEL_STATE` wins; else macOS
+    /// `~/Library/Application Support/onemodel`, Linux `$XDG_STATE_HOME/onemodel` or
+    /// `~/.local/state/onemodel`.
     pub fn state_dir(&self) -> PathBuf {
-        todo!()
+        if let Some(dir) = &self.state {
+            return dir.clone();
+        }
+        if cfg!(target_os = "macos") {
+            return self.home.join("Library/Application Support/onemodel");
+        }
+        match self.var("XDG_STATE_HOME") {
+            Some(dir) if Path::new(dir).is_absolute() => Path::new(dir).join("onemodel"),
+            _ => self.home.join(".local/state/onemodel"),
+        }
     }
 
     /// Path of the lsof binary: `ONEMODEL_LSOF` if set, else `/usr/sbin/lsof` on macOS, else `lsof` on PATH.
     pub fn lsof(&self) -> PathBuf {
-        todo!()
+        match self.var("ONEMODEL_LSOF") {
+            Some(p) => PathBuf::from(p),
+            None if cfg!(target_os = "macos") => PathBuf::from("/usr/sbin/lsof"),
+            None => PathBuf::from("lsof"),
+        }
+    }
+
+    /// `path` with the home directory written as `~`, for human output.
+    pub fn show(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        }
     }
 }
 
@@ -145,7 +193,7 @@ fn main() -> ExitCode {
 
 /// Flat dispatch: build `Env`, call one command, render its report. No logic lives here.
 fn run(cli: Cli) -> anyhow::Result<Exit> {
-    let env = Env::from_process(cli.paths, cli.min_size)?;
+    let env = Env::from_process(cli.paths, cli.min_size, cli.state)?;
     match cli.cmd {
         Cmd::Scan => {
             let report = commands::scan(&env)?;
