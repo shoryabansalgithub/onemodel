@@ -504,6 +504,59 @@ fn redownloaded_keeper_costs_one_op() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn savings_are_measured_from_free_space() {
+    let Some(mut fx) = Fixture::empty() else { return };
+    let vol = Volume::attach(&fx, "APFS", 200);
+    fx.extra_args = vec!["--path".into(), vol.mount.display().to_string()];
+    let big: Vec<u8> = content("big").repeat(10);
+    put(&vol.mount.join("one.gguf"), &big, 0o644, 1_700_000_001, None);
+    put(&vol.mount.join("two.gguf"), &big, 0o644, 1_700_000_002, None);
+
+    let report = fx.json(&["dedupe"]);
+    assert_eq!(report["results"].as_array().unwrap().len(), 1);
+    let freed = freed_on(&report, &vol.mount);
+    let dup = big.len() as i64;
+    assert!((freed - dup).abs() < 4 * MIB as i64, "freed {freed} bytes for a {dup}-byte duplicate");
+    assert_eq!(fs::read(vol.mount.join("two.gguf")).unwrap(), big);
+
+    let filler = vol.mount.join("filler");
+    let mut f = File::create(&filler).unwrap();
+    while statfs_free(&vol.mount) > 30 * MIB as u64 {
+        f.write_all(&[1u8; MIB]).unwrap();
+        f.sync_all().unwrap();
+    }
+    drop(f);
+    let refused = fx.json_code(&["undo"], 2);
+    assert_eq!(refused["results"][0]["refusal"]["reason"], json!("not_enough_space"));
+    fs::remove_file(&filler).unwrap();
+
+    let undo = fx.json(&["undo"]);
+    assert_eq!(undo["results"][0]["outcome"], json!("restored"));
+    let used = -freed_on(&undo, &vol.mount);
+    assert!((used - dup).abs() < 4 * MIB as i64, "undo used {used} bytes for a {dup}-byte file");
+    eprintln!("APFS volume: dedupe freed {freed} and undo used {used} bytes for a {dup}-byte duplicate");
+    assert_eq!(fs::read(vol.mount.join("two.gguf")).unwrap(), big);
+}
+
+#[cfg(target_os = "macos")]
+fn freed_on(report: &Value, mount: &Path) -> i64 {
+    let space = report["space"].as_array().unwrap();
+    let d = space.iter().find(|d| Path::new(d["mount"].as_str().unwrap()) == mount).unwrap();
+    d["free_after"].as_i64().unwrap() - d["free_before"].as_i64().unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn statfs_free(path: &Path) -> u64 {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c` is NUL-terminated and `st` is a valid out-pointer.
+    assert_eq!(unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) }, 0);
+    // SAFETY: statfs returned 0.
+    let st = unsafe { st.assume_init() };
+    st.f_bavail * st.f_bsize as u64
+}
+
 /// Undo restores bytes, mode, mtime and separate inodes. Per-path xattrs are lost in hardlink
 /// mode, which the warning says.
 #[test]
