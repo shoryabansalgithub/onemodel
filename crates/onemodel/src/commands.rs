@@ -81,7 +81,7 @@ pub struct DedupeReport {
     pub plan: Plan,
     /// One per op, in op order.
     pub results: Vec<OpResult>,
-    /// Measured: statvfs free bytes per volume, plan time vs end of run.
+    /// Measured: statfs free bytes per volume, plan time vs end of run.
     pub space: Vec<SpaceDelta>,
 }
 
@@ -117,8 +117,67 @@ pub struct SpaceDelta {
 /// ```
 /// A resumed run reports `free_before` from its plan, so the measured savings cover the whole run.
 pub fn dedupe(env: &Env, mode: Mode, dry_run: bool) -> anyhow::Result<DedupeReport> {
-    let _ = (env, mode, dry_run, Journal::open, crash_point as fn(CrashPoint));
-    todo!()
+    let journal = Journal::open(&env.state_dir())?;
+    let runs = journal.runs()?;
+    if let Some(run) = runs.iter().find(|r| !r.ended) {
+        if dry_run {
+            return Ok(DedupeReport {
+                run: Some(run.id.clone()),
+                dry_run,
+                resumed: true,
+                mode: run.plan.mode,
+                plan: run.plan.clone(),
+                results: Vec::new(),
+                space: Vec::new(),
+            });
+        }
+        let mut writer = journal.reopen(run)?;
+        return execute(env, run, &mut writer, true);
+    }
+    let plan = fresh_plan(env, mode, &runs)?;
+    if dry_run || plan.op_count() == 0 {
+        return Ok(DedupeReport {
+            run: None,
+            dry_run,
+            resumed: false,
+            mode,
+            plan,
+            results: Vec::new(),
+            space: Vec::new(),
+        });
+    }
+    let (mut writer, run) = journal.begin(plan)?;
+    crash_point(CrashPoint::AfterPlan);
+    execute(env, &run, &mut writer, false)
+}
+
+fn execute(env: &Env, run: &RunLog, writer: &mut RunWriter, resumed: bool) -> anyhow::Result<DedupeReport> {
+    let lsof = env.lsof();
+    let mut cx = Ctx { run: &run.id, plan: &run.plan, mode: run.plan.mode, lsof: &lsof, writer };
+    let mut results = Vec::new();
+    for op in run.plan.ops() {
+        let outcome = replace::drive(&mut cx, op, &run.ops[op.ix as usize])?;
+        results.push(OpResult { op: op.ix, target: op.target.path.clone(), keeper: op.keeper.path.clone(), outcome });
+    }
+    crash_point(CrashPoint::BeforeEnd);
+    let free_after = measure(&run.plan.volumes)?;
+    cx.writer.append(&Record::End { free_after: free_after.clone() })?;
+    let space = run
+        .plan
+        .volumes
+        .iter()
+        .zip(&free_after)
+        .map(|(v, (_, after))| SpaceDelta { mount: v.mount.clone(), free_before: v.free_before, free_after: *after })
+        .collect();
+    Ok(DedupeReport {
+        run: Some(run.id.clone()),
+        dry_run: false,
+        resumed,
+        mode: run.plan.mode,
+        plan: run.plan.clone(),
+        results,
+        space,
+    })
 }
 
 /// (dev, free bytes) for every volume, in order.
