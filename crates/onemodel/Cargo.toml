@@ -1,0 +1,35 @@
+[package]
+name = "onemodel"
+version = "0.1.0"
+description = "Dedupe byte-identical AI model files across local-AI app stores with copy-on-write clones, reversibly"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Operational errors with context at the shell (journal unwritable, store unreadable). Domain
+# refusals never go through anyhow: they are the typed `plan::Refusal` enum.
+anyhow = "1"
+# Content identity: partial and full hashes for grouping, and `verify`. Fast enough to be disk-bound.
+blake3 = "1"
+# CLI surface via derive; also `ValueEnum` for the crash-point names parsed from the env seam.
+clap = { version = "4", features = ["derive"] }
+# The only way to reach clonefile(2), ioctl(FICLONE), statfs/statvfs, flock(2) and kill(SIGKILL).
+libc = "0.2"
+# Journal records and `--json` reports share one set of derives; the journal IS serialized domain types.
+serde = { version = "1", features = ["derive"] }
+# JSONL journal, Ollama manifests, LM Studio settings.json, `--json` output.
+serde_json = "1"
+# `verify --deep` only: Ollama and HF blob names are sha256 digests of their content.
+sha2 = "0.10"
+# No-follow recursive traversal of store roots (symlink chains in the HF cache must never be followed).
+walkdir = "2"
+# list/get/set/remove xattrs with nofollow; hides the macOS vs Linux signature differences.
+xattr = "1"
+
+[dev-dependencies]
+# Per-test fixture HOME and state dirs. Every e2e test runs the built binary against one of these.
+tempfile = "3"
