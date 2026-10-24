@@ -5,9 +5,13 @@
 //! partial-hash window cannot leak anywhere.
 //!
 //! Hash equality only *proposes* a duplicate. Nothing in this module decides a replacement; the
-//! byte-for-byte compare that authorizes one happens in `replace::replace`, against the clone itself.
+//! byte-for-byte compare that authorizes one happens in `replace`, against the clone itself.
 
-use std::io;
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::fs::{File, Metadata};
+use std::io::{self, Read};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +44,19 @@ pub struct Fingerprint {
 impl Fingerprint {
     /// lstat, never following symlinks.
     pub fn of(path: &Path) -> io::Result<Fingerprint> {
-        todo!("{path:?}: std::fs::symlink_metadata + MetadataExt")
+        Ok(Fingerprint::from_metadata(&std::fs::symlink_metadata(path)?))
+    }
+
+    pub fn from_metadata(m: &Metadata) -> Fingerprint {
+        Fingerprint {
+            id: FileId { dev: m.dev(), ino: m.ino() },
+            size: m.size(),
+            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+            nlink: m.nlink(),
+            uid: m.uid(),
+            mode: m.mode(),
+        }
     }
 
     pub fn same_file_unchanged(&self, now: &Fingerprint) -> bool {
@@ -52,17 +68,38 @@ impl Fingerprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash(pub [u8; 32]);
 
-impl Serialize for Hash {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let _ = s;
-        todo!("hex")
+impl Hash {
+    pub fn hex(&self) -> String {
+        to_hex(&self.0)
     }
 }
+
+impl Serialize for Hash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.hex())
+    }
+}
+
 impl<'de> Deserialize<'de> for Hash {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let _ = d;
-        todo!("hex")
+        let s = String::deserialize(d)?;
+        parse_hex32(&s).map(Hash).ok_or_else(|| serde::de::Error::custom(format!("not a 64-char hex hash: {s}")))
     }
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// One inode and every candidate path that names it (hardlinks collapsed). `paths` sorted.
