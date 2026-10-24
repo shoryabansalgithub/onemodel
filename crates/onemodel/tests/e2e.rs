@@ -487,3 +487,42 @@ fn verify_deep_checks_every_ollama_blob_against_its_manifest() {
     assert_eq!(deep["problems"][0]["kind"], json!("claim_digest_mismatch"));
     assert_eq!(fx.name(deep["problems"][0]["path"].as_str().unwrap()), OLLAMA_B);
 }
+
+/// When an app re-downloads the keeper (new inode, same bytes), one op re-shares it with an
+/// existing clone instead of re-cloning every target.
+#[test]
+fn redownloaded_keeper_costs_one_op() {
+    let Some(fx) = Fixture::new() else { return };
+    fx.json(&["dedupe"]);
+    fs::remove_file(fx.path(LM_A)).unwrap();
+    put(&fx.path(LM_A), &content("A"), 0o640, 1_700_000_099, Some("lm-a-again"));
+    let report = fx.json(&["dedupe"]);
+    assert_eq!(fx.outcomes(&report), pairs(&[(LM_A, "replaced")]));
+    assert_eq!(fx.name(report["results"][0]["keeper"].as_str().unwrap()), OLLAMA_A);
+    assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+    assert_eq!(fx.json(&["scan"])["reclaimable"], json!(0));
+}
+
+#[cfg(target_os = "macos")]
+/// Undo restores bytes, mode, mtime and separate inodes. Per-path xattrs are lost in hardlink
+/// mode, which the warning says.
+#[test]
+fn hardlink_mode_warns_and_links_and_undo_unlinks() {
+    let Some(fx) = Fixture::new() else { return };
+    let before = disk(&fx);
+    let out = fx.run(&["--json", "dedupe", "--hardlink"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("If any app writes to one path, every other path changes too"), "{stderr}");
+    assert!(same_inode(&fx, LM_A, OLLAMA_A) && same_inode(&fx, LM_A, LLAMA_A) && same_inode(&fx, LM_A, HF_A));
+    assert!(same_inode(&fx, OLLAMA_B, LLAMA_B) && same_inode(&fx, OLLAMA_B, EXTRA_B));
+    assert_eq!(fs::metadata(fx.path(LM_A)).unwrap().nlink(), 4);
+    assert_eq!(fx.json(&["verify"])["problems"], json!([]));
+    assert_eq!(fx.json(&["dedupe"])["results"], json!([]));
+
+    fx.json(&["undo"]);
+    assert_eq!(fs::metadata(fx.path(LM_A)).unwrap().nlink(), 1);
+    let without_xattrs =
+        |d: &Disk| d.0.iter().map(|l| l.split(" xattrs=").next().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(without_xattrs(&disk(&fx)), without_xattrs(&before));
+}
