@@ -1,8 +1,11 @@
 //! llama.cpp `-hf` cache: `$LLAMA_CACHE`, else `~/Library/Caches/llama.cpp` (macOS) or
-//! `~/.cache/llama.cpp` (Linux). Flat `*.gguf` plus `.json` etag sidecars; `*.downloadInProgress`.
+//! `~/.cache/llama.cpp` (Linux). Current builds write the Hugging Face hub layout here; older ones
+//! wrote flat `*.gguf` files with `.json` etag sidecars. Downloads in flight end in
+//! `.downloadInProgress`.
 
 use std::path::{Path, PathBuf};
 
+use super::huggingface::hub_classify;
 use super::{Entry, StoreKind};
 use crate::Env;
 
@@ -24,8 +27,14 @@ impl StoreKind for LlamaCpp {
         }
     }
 
-    /// `*.downloadInProgress` -> InProgress, `*.gguf` -> Candidate, else Ignore.
     fn classify(&self, rel: &Path) -> Entry {
-        todo!("{rel:?}")
+        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".downloadInProgress") {
+            return Entry::InProgress;
+        }
+        match hub_classify(rel) {
+            Entry::Ignore if rel.components().count() == 1 && name.ends_with(".gguf") => Entry::Candidate,
+            entry => entry,
+        }
     }
 }
