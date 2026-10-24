@@ -16,5 +16,12 @@ unsafe_op_in_unsafe_fn = "deny"
 # unsafe is confined to platform.rs; everything else must stay safe.
 undocumented_unsafe_blocks = "deny"
 
+# Hashing dominates test time; unoptimized BLAKE3 and SHA-256 are about 20x slower.
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
