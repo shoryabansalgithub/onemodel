@@ -197,7 +197,7 @@ fn run(cli: Cli) -> anyhow::Result<Exit> {
     match cli.cmd {
         Cmd::Scan => {
             let report = commands::scan(&env)?;
-            render(cli.json, &report)
+            render(&env, cli.json, &report)
         }
         Cmd::Dedupe { dry_run, hardlink } => {
             let mode = if hardlink { Mode::Hardlink } else { Mode::Clone };
@@ -205,15 +205,15 @@ fn run(cli: Cli) -> anyhow::Result<Exit> {
                 eprintln!("{}", HARDLINK_WARNING);
             }
             let report = commands::dedupe(&env, mode, dry_run)?;
-            render(cli.json, &report)
+            render(&env, cli.json, &report)
         }
         Cmd::Undo { run } => {
             let report = commands::undo(&env, run)?;
-            render(cli.json, &report)
+            render(&env, cli.json, &report)
         }
         Cmd::Verify { deep } => {
             let report = commands::verify(&env, deep)?;
-            render(cli.json, &report)
+            render(&env, cli.json, &report)
         }
     }
 }
@@ -224,15 +224,15 @@ Prefer clones (the default) on APFS, btrfs and XFS.";
 
 /// Every report knows its exit code and both of its renderings, so `run` stays a dispatcher.
 pub trait Report: serde::Serialize {
-    fn human(&self) -> String;
+    fn human(&self, env: &Env) -> String;
     fn exit(&self) -> Exit;
 }
 
-fn render<R: Report>(json: bool, report: &R) -> anyhow::Result<Exit> {
+fn render<R: Report>(env: &Env, json: bool, report: &R) -> anyhow::Result<Exit> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
     } else {
-        print!("{}", report.human());
+        print!("{}", report.human(env));
     }
     Ok(report.exit())
 }

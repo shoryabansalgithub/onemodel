@@ -364,8 +364,8 @@ fn check_hash(report: &mut VerifyReport, path: PathBuf, expected: matching::Hash
 }
 
 impl Report for ScanReport {
-    fn human(&self) -> String {
-        todo!("stores table, groups with keeper/clone/refuse lines, reclaimable total")
+    fn human(&self, _env: &Env) -> String {
+        format!("{} duplicate groups, {} bytes reclaimable\n", self.groups.len(), self.reclaimable)
     }
     fn exit(&self) -> Exit {
         Exit::Ok
@@ -373,8 +373,8 @@ impl Report for ScanReport {
 }
 
 impl Report for DedupeReport {
-    fn human(&self) -> String {
-        todo!("per-op lines, refusals with reasons, measured freed bytes per volume")
+    fn human(&self, _env: &Env) -> String {
+        format!("{} ops\n", self.results.len())
     }
     fn exit(&self) -> Exit {
         Exit::Ok
@@ -382,8 +382,8 @@ impl Report for DedupeReport {
 }
 
 impl Report for UndoReport {
-    fn human(&self) -> String {
-        todo!()
+    fn human(&self, _env: &Env) -> String {
+        format!("{} ops\n", self.results.len())
     }
     fn exit(&self) -> Exit {
         let unsettled = self.results.iter().any(|(_, r)| matches!(r.outcome, Outcome::Refused { .. }));
@@ -392,8 +392,8 @@ impl Report for UndoReport {
 }
 
 impl Report for VerifyReport {
-    fn human(&self) -> String {
-        todo!()
+    fn human(&self, _env: &Env) -> String {
+        format!("{} problems\n", self.problems.len())
     }
     fn exit(&self) -> Exit {
         if self.problems.is_empty() { Exit::Ok } else { Exit::Problems }
