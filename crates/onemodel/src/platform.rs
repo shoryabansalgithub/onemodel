@@ -219,10 +219,21 @@ pub fn xattrs(path: &Path) -> io::Result<BTreeMap<std::ffi::OsString, Vec<u8>>> 
 /// A real, unshared byte copy: create `dst` O_EXCL, read/write loop with an 8 MiB buffer.
 /// Never `std::fs::copy`: on macOS it uses fclonefileat and would produce a clone.
 pub fn real_copy(src: &Path, dst: &Path) -> io::Result<()> {
-    let _ = (src, dst);
-    todo!()
+    let mut input = File::open(src)?;
+    let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(dst)?;
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        output.write_all(&buf[..n])?;
+    }
 }
 
+/// fsync (F_FULLFSYNC on macOS, via std).
 pub fn fsync_file(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
