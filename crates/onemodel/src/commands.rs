@@ -464,8 +464,7 @@ impl Report for DedupeReport {
         if self.dry_run {
             out.push_str(&groups_text(env, &self.plan.groups));
             out.push_str(&format!(
-                "dry run: would clone {} and free up to {}{}\n",
-                plural(self.plan.op_count(), "file"),
+                "dry run: would free up to {}{}\n",
                 fmt_bytes(self.plan.reclaimable()),
                 tally(&self.plan.groups)
             ));
