@@ -16,13 +16,16 @@
 //!
 //! Undo appends to the run file of the op it reverses, so an op's whole life is in one place.
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::matching::{FileId, Hash};
 use crate::plan::{Plan, Refusal};
+use crate::platform;
 
 /// `<unix-seconds>-<pid>`: sortable by start time, unique per machine (one onemodel at a time).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +169,29 @@ impl Journal {
     /// mkdir -p, take the lock. A held lock is an error: "another onemodel (pid N) is running".
     /// The pid is read from the lock file, written after locking, for the message only.
     pub fn open(state_dir: &Path) -> anyhow::Result<Journal> {
-        todo!("{state_dir:?}")
+        let runs = state_dir.join("runs");
+        fs::create_dir_all(&runs).with_context(|| format!("cannot create the journal at {}", runs.display()))?;
+        let path = state_dir.join("lock");
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        if !platform::try_lock_exclusive(&lock)? {
+            let mut pid = String::new();
+            let _ = lock.read_to_string(&mut pid);
+            bail!("another onemodel (pid {}) is running; wait for it to finish", pid.trim());
+        }
+        lock.set_len(0)?;
+        lock.rewind()?;
+        write!(lock, "{}", std::process::id())?;
+        Ok(Journal { dir: state_dir.to_path_buf(), _lock: lock })
+    }
+
+    fn runs_dir(&self) -> PathBuf {
+        self.dir.join("runs")
     }
 
     /// Every run, oldest first, replayed into op states.
