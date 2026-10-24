@@ -97,7 +97,7 @@ fn space_deltas(volumes: &[Volume], free_after: &[(u64, u64)]) -> Vec<SpaceDelta
     volumes
         .iter()
         .zip(free_after)
-        .map(|(v, (_, after))| SpaceDelta { mount: v.mount.clone(), free_before: v.free, free_after: *after })
+        .map(|(v, (_, after))| SpaceDelta { mount: v.mount.clone(), free_before: v.free_before, free_after: *after })
         .collect()
 }
 
@@ -198,7 +198,7 @@ pub fn undo(env: &Env, run: Option<RunId>, only: &[PathBuf]) -> anyhow::Result<U
     let mut volumes: Vec<Volume> = Vec::new();
     for v in selected.iter().flat_map(|r| &r.plan.volumes) {
         if !volumes.iter().any(|seen| seen.dev == v.dev) {
-            volumes.push(Volume { free: platform::free_bytes(&v.mount)?, ..v.clone() });
+            volumes.push(Volume { free_before: platform::free_bytes(&v.mount)?, ..v.clone() });
         }
     }
     let mut results = Vec::new();
@@ -262,7 +262,7 @@ pub fn verify(env: &Env, deep: bool) -> anyhow::Result<VerifyReport> {
     for m in journal::managed(&runs) {
         match Fingerprint::of(&m.target) {
             Err(_) => report.problems.push(Problem::Missing { path: m.target.clone() }),
-            Ok(now) if now.id != m.ino => report.released.push(m.target.clone()),
+            Ok(now) if now.id != m.id_after_swap => report.released.push(m.target.clone()),
             Ok(_) => {
                 ours.insert(m.target.clone());
                 check_hash(&mut report, m.target.clone(), m.hash, m.size);

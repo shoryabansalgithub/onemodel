@@ -94,7 +94,7 @@ pub struct RunLog {
 pub struct Managed {
     pub run: RunId,
     pub target: PathBuf,
-    pub ino: FileId,
+    pub id_after_swap: FileId,
     pub keeper: PathBuf,
     pub keeper_id: FileId,
     pub hash: Hash,
@@ -126,6 +126,12 @@ impl Journal {
         lock.set_len(0)?;
         lock.rewind()?;
         write!(lock, "{}", std::process::id())?;
+        for entry in fs::read_dir(&runs)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "tmp") {
+                fs::remove_file(&path)?;
+            }
+        }
         Ok(Journal { dir: state_dir.to_path_buf(), _lock: lock })
     }
 
@@ -137,13 +143,9 @@ impl Journal {
         let mut runs = Vec::new();
         for entry in fs::read_dir(self.runs_dir())? {
             let path = entry?.path();
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("jsonl") => {
-                    let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-                    runs.push(replay(path.clone(), &bytes).with_context(|| format!("journal {}", path.display()))?);
-                }
-                Some("tmp") => fs::remove_file(&path)?,
-                _ => {}
+            if path.extension().is_some_and(|e| e == "jsonl") {
+                let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+                runs.push(replay(path.clone(), &bytes).with_context(|| format!("journal {}", path.display()))?);
             }
         }
         runs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -271,7 +273,7 @@ pub fn managed(runs: &[RunLog]) -> Vec<Managed> {
             out.push(Managed {
                 run: run.id.clone(),
                 target: op.target.path.clone(),
-                ino: FileId { dev: op.target.stat.id.dev, ino },
+                id_after_swap: FileId { dev: op.target.stat.id.dev, ino },
                 keeper: op.keeper.path.clone(),
                 keeper_id: op.keeper.stat.id,
                 hash: op.hash,

@@ -37,7 +37,7 @@ pub struct GroupPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Member {
     pub path: PathBuf,
-    pub also: Vec<PathBuf>,
+    pub other_links: Vec<PathBuf>,
     pub store: StoreIx,
     pub stat: Fingerprint,
     #[serde(flatten)]
@@ -185,7 +185,7 @@ struct Facts<'a> {
 
 fn decide(facts: &Facts<'_>, groups: Vec<crate::matching::DupGroup>, mode: Mode) -> Vec<GroupPlan> {
     let managed_keepers: BTreeSet<(FileId, Hash)> = facts.managed.iter().map(|m| (m.keeper_id, m.hash)).collect();
-    let managed_targets: BTreeSet<(FileId, Hash)> = facts.managed.iter().map(|m| (m.ino, m.hash)).collect();
+    let managed_targets: BTreeSet<(FileId, Hash)> = facts.managed.iter().map(|m| (m.id_after_swap, m.hash)).collect();
     let mut next_op = 0u32;
     let mut out = Vec::new();
     for g in groups {
@@ -273,7 +273,7 @@ fn decide(facts: &Facts<'_>, groups: Vec<crate::matching::DupGroup>, mode: Mode)
                 }
                 let mut paths = inode.paths.into_iter();
                 let (path, store) = paths.next().expect("an inode has at least one path");
-                Member { path, also: paths.map(|(p, _)| p).collect(), store, stat: inode.stat, role }
+                Member { path, other_links: paths.map(|(p, _)| p).collect(), store, stat: inode.stat, role }
             })
             .collect();
         out.push(GroupPlan { hash: g.hash, size: g.size, members });

@@ -65,8 +65,7 @@ pub struct Volume {
     pub mount: PathBuf,
     pub fs_type: String,
     pub clones: bool,
-    #[serde(rename = "free_before")]
-    pub free: u64,
+    pub free_before: u64,
 }
 
 pub fn volume(path: &Path) -> io::Result<Volume> {
@@ -84,7 +83,7 @@ pub fn volume(path: &Path) -> io::Result<Volume> {
             )
         };
         let clones = fs_type == "apfs";
-        Ok(Volume { dev, mount, fs_type, clones, free: free_bytes(path)? })
+        Ok(Volume { dev, mount, fs_type, clones, free_before: free_bytes(path)? })
     }
     #[cfg(target_os = "linux")]
     {
@@ -104,7 +103,7 @@ pub fn volume(path: &Path) -> io::Result<Volume> {
             }
             mount = parent.to_path_buf();
         }
-        Ok(Volume { dev, mount, fs_type, clones, free: free_bytes(path)? })
+        Ok(Volume { dev, mount, fs_type, clones, free_before: free_bytes(path)? })
     }
 }
 
