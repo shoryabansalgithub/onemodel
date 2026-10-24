@@ -31,6 +31,8 @@ use clap::{Parser, Subcommand};
 use crate::journal::RunId;
 use crate::plan::Mode;
 
+const GLOBAL: &str = "Options for every command";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "onemodel",
@@ -42,19 +44,19 @@ change is journaled first, so an interrupted run can be resumed or undone."
 )]
 struct Cli {
     /// Also treat DIR as a store. Repeatable. Every regular file of at least --min-size inside is a candidate.
-    #[arg(long = "path", value_name = "DIR", global = true)]
+    #[arg(long = "path", value_name = "DIR", global = true, help_heading = GLOBAL)]
     paths: Vec<PathBuf>,
 
     /// Ignore files smaller than this. Accepts K, M and G suffixes (powers of 1024).
-    #[arg(long, value_name = "SIZE", default_value = "32M", value_parser = parse_size, global = true)]
+    #[arg(long, value_name = "SIZE", default_value = "32M", value_parser = parse_size, global = true, help_heading = GLOBAL)]
     min_size: u64,
 
     /// Keep the journal in DIR instead of the default location.
-    #[arg(long, value_name = "DIR", env = "ONEMODEL_STATE", global = true)]
+    #[arg(long, value_name = "DIR", env = "ONEMODEL_STATE", global = true, help_heading = GLOBAL)]
     state: Option<PathBuf>,
 
     /// Print one JSON document on stdout instead of text. Warnings still go to stderr.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL)]
     json: bool,
 
     #[command(subcommand)]
@@ -63,19 +65,19 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Find stores and duplicate files and report reclaimable space. Changes nothing.
+    /// Report stores, duplicate files and reclaimable space. Changes nothing.
     Scan,
-    /// Replace duplicates with clones of one copy per volume. Finishes an interrupted run first.
+    /// Replace duplicates with clones of one copy. Resumes an interrupted run first.
     Dedupe {
         /// Show what would be replaced or refused, then stop. Writes nothing.
         #[arg(long)]
         dry_run: bool,
         /// Use hard links instead of clones. A write through any one path then changes every path,
-        /// and each path loses its own xattrs. Works on filesystems without clone support.
+        /// and each path loses its own xattrs. Works without clone support.
         #[arg(long)]
         hardlink: bool,
     },
-    /// Turn every file onemodel replaced back into an independent copy. Needs the space back.
+    /// Make every replaced file an independent copy again. Needs the space back.
     Undo {
         /// Only undo this run (ids are listed by `scan`). Default: every run, newest first.
         #[arg(long, value_name = "RUN_ID")]
@@ -84,8 +86,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         only: Vec<PathBuf>,
     },
-    /// Check that every managed file still has its planned bytes and every store is intact.
-    /// Exits with status 2 if anything is wrong.
+    /// Check that managed files and stores are intact. Exits 2 on any problem.
     Verify {
         /// Also check every Ollama blob against the sha256 in its manifest.
         #[arg(long)]
